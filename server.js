@@ -1,6 +1,7 @@
 // server.js
 // Render settings:
-//   Build Command: npm install && PUPPETEER_CACHE_DIR=/opt/render/project/src/.puppeteer-cache npx puppeteer browsers install chrome --platform=linux
+//   Build Command:
+//     npm install && PUPPETEER_CACHE_DIR=/opt/render/project/src/.puppeteer-cache npx puppeteer browsers install chrome --platform=linux
 //   Start Command: node ./server.js
 //   Env: NODE_VERSION=20
 //   Root Directory: (blank) or "."
@@ -17,11 +18,10 @@ const app = express();
 app.use(cors());
 app.use(morgan("tiny"));
 
-/* ---------- helpers ---------- */
+/* ----------------------- small utilities ----------------------- */
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function normalizeIdOrUrl(raw) {
@@ -34,17 +34,15 @@ function normalizeIdOrUrl(raw) {
 
 const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
 
-/** Robust parser that understands the Local Guide modal labels. */
+/** Text parser — used mainly for Level & Points and as a fallback */
 function pullCountsFrom(text) {
-  // “label then number” or “number then label”, allow up to 100 chars between (handles newlines)
   const near = (label) => {
-    const A = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");               // "15 Photos"
-    const B = new RegExp(`(?:${label})[\\s\\S]{0,100}?(\\d[\\d,\\.]*)`, "i");  // "Photos\n15"
+    const A = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
+    const B = new RegExp(`(?:${label})[\\s\\S]{0,100}?(\\d[\\d,\\.]*)`, "i");
     const m = text.match(A) || text.match(B);
     return m ? toNum(m[1]) : 0;
   };
 
-  // Level / points (chip & modal both show these)
   const levelMatch =
     /Local Guide[^\n]{0,200}?Level\s*(\d+)/i.exec(text) ||
     /Local Guide[^\n]{0,200}?[•·]\s*Level\s*(\d+)/i.exec(text);
@@ -57,45 +55,31 @@ function pullCountsFrom(text) {
       return m ? toNum(m[1]) : 0;
     })();
 
-  // Modal labels (as in your screenshot) + a couple synonyms
-  const reviews       = near("reviews?");
-  const ratings       = near("ratings?");
-  const photos        = near("photos?");
-  const videos        = near("videos?");
-  const captions      = near("captions?");
-  const answers       = near("answers?"); // will map to `questions`
-  const edits         = near("edits?");
-  const reportedWrong = near("reported\\s+incorrect");
-  const factsChecked  = near("facts?\\s*checked");
-  const placesAdded   = near("places?\\s+added");
-  const roadsAdded    = near("roads?\\s+added");
-  // Q&A sometimes appears; we don’t store it yet
-  // const qa = near("Q\\s*&\\s*A|Q\\s*\\+\\s*A|Q&A");
-
+  // These may be 0 here; modal extraction will override
   return {
     level,
     points,
-    reviews,
-    ratings,
-    photos,
-    edits,
-    questions: answers,                              // “Answers” → questions
-    facts: Math.max(reportedWrong, factsChecked),    // consolidate
-    roadsAdded,
-    placesAdded,
-    listsPublished: 0                                // not shown in this modal
-    // videos, captions // available if you decide to add to your schema later
+    reviews: near("reviews?"),
+    ratings: near("ratings?"),
+    photos: near("photos?"),
+    edits: near("edits?"),
+    questions: near("answers?"),
+    facts: Math.max(near("reported\\s+incorrect"), near("facts?\\s*checked")),
+    roadsAdded: near("roads?\\s+added"),
+    placesAdded: near("places?\\s+added"),
+    listsPublished: 0
   };
 }
 
-// Find a Chrome/Chromium binary we installed at build-time.
+/* --------------------- Chrome discovery & launch --------------------- */
+
 function findChromeBinary() {
-  // manual override wins
+  // 1) manual override
   const override = process.env.PUPPETEER_EXECUTABLE_PATH;
   if (override) {
     try { fs.accessSync(override, fs.constants.X_OK); return override; } catch {}
   }
-  // our persistent cache on Render
+  // 2) project cache on Render
   const ROOT = "/opt/render/project/src/.puppeteer-cache";
   const names = new Set(["chrome", "chrome-headless-shell", "Chromium"]);
   if (fs.existsSync(ROOT)) {
@@ -111,7 +95,7 @@ function findChromeBinary() {
       }
     }
   }
-  // fallback: puppeteer’s own location
+  // 3) puppeteer’s own bundled path (if any)
   try {
     const p = puppeteer.executablePath();
     fs.accessSync(p, fs.constants.X_OK);
@@ -136,28 +120,82 @@ async function launchBrowser() {
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--no-first-run",
-      "--no-default-browser-check",
-    ],
+      "--no-default-browser-check"
+    ]
   });
 }
 
-/* ---------- core scraping ---------- */
+/* --------------------- DOM-first modal extraction --------------------- */
+
+async function openStatsModal(page) {
+  // Click the chip that opens the stats modal (your selector from the DOM dump)
+  const sel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
+  const exists = await page.$(sel);
+  if (exists) {
+    await page.click(sel).catch(() => {});
+  } else {
+    // Fallback: click any element whose text contains "points"
+    await page.evaluate(() => {
+      const nodes = [...document.querySelectorAll('button,[role="button"],a,div,span')];
+      const el = nodes.find(n => /points/i.test(n.textContent || ""));
+      if (el) el.click();
+    });
+  }
+  // Wait briefly for modal rows to render
+  try {
+    await page.waitForSelector(".QrGqBf .nKYSz", { timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function extractCountsFromModal(page) {
+  return await page.evaluate(() => {
+    const toNum = v => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
+    const out = {
+      reviews: 0, ratings: 0, photos: 0, edits: 0, questions: 0, facts: 0,
+      roadsAdded: 0, placesAdded: 0, listsPublished: 0
+    };
+    const rows = Array.from(document.querySelectorAll(".QrGqBf .nKYSz"));
+    for (const r of rows) {
+      const label = (r.querySelector(".FM5HI")?.textContent || "").trim().toLowerCase();
+      const value = toNum(r.querySelector(".AyEQdd")?.textContent || "0");
+      switch (label) {
+        case "reviews": out.reviews = value; break;
+        case "ratings": out.ratings = value; break;
+        case "photos": out.photos = value; break;
+        case "videos": /* not in schema */ break;
+        case "captions": /* not in schema */ break;
+        case "answers": out.questions = value; break;
+        case "edits": out.edits = value; break;
+        case "reported incorrect": out.facts = Math.max(out.facts, value); break;
+        case "facts checked": out.facts = Math.max(out.facts, value); break;
+        case "places added": out.placesAdded = value; break;
+        case "roads added": out.roadsAdded = value; break;
+        case "q&a": /* ignore for now */ break;
+      }
+    }
+    return out;
+  });
+}
+
+/* --------------------------- core scraper --------------------------- */
 
 async function scrapeCounts(contribUrl) {
   const browser = await launchBrowser();
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
 
-  // Speed + stability
   await page.setUserAgent(UA);
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
   page.setDefaultNavigationTimeout?.(90_000);
   page.setDefaultTimeout?.(45_000);
 
-  // Avoid consent interstitials
+  // Avoid consent wall
   await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
 
-  // Block heavy assets; keep XHR/fetch alive
+  // Block heavy assets
   if (page.setRequestInterception) {
     await page.setRequestInterception(true);
     page.on("request", (req) => {
@@ -167,10 +205,9 @@ async function scrapeCounts(contribUrl) {
     });
   }
 
-  // Two URL variants hydrate different shells
   const candidates = [
     `${contribUrl}?hl=en&gl=us&authuser=0`,
-    `${contribUrl}/reviews?hl=en&gl=us&authuser=0`,
+    `${contribUrl}/reviews?hl=en&gl=us&authuser=0`
   ];
 
   let lastErr = null;
@@ -179,56 +216,43 @@ async function scrapeCounts(contribUrl) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
 
-      // Try to open the “Local Guide” modal so the per-category rows render
-      try {
-        await page.evaluate(() => {
-          const nodes = [...document.querySelectorAll('button, div[role="button"], a, div')];
-          const el = nodes.find(n => /Local Guide/i.test(n.innerText || ""));
-          if (el) el.click();
-        });
-        await sleep(800);
-      } catch {}
+      // open the Local Guide stats modal
+      await openStatsModal(page);
 
-      // Nudge hydration / lazy sections
-      for (let i = 0; i < 3; i++) {
+      // small hydration nudges
+      for (let i = 0; i < 2; i++) {
         await page.evaluate((y) => window.scrollTo(0, y), 350 * (i + 1));
-        await sleep(700);
+        await sleep(600);
       }
 
-      // Content-based wait (don’t rely on networkidle)
-      try {
-        await page.waitForFunction(
-          () => {
-            const t = (document.body.innerText || "").replace(/\s+/g, " ").trim();
-            return (
-              /Local Guide/i.test(t) ||
-              /\breviews?\b/i.test(t) ||
-              /\bpoints?\b/i.test(t) ||
-              /\bphotos?\b/i.test(t)
-            );
-          },
-          { timeout: 20_000, polling: 500 }
-        );
-      } catch {}
+      // Prefer DOM extraction from the modal for per-category
+      const domCounts = await extractCountsFromModal(page);
 
-      // Pull visible text and parse
+      // Always parse text for Level/Points (+ fallback if modal missed something)
       let bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       if (/Before you continue to Google/i.test(bodyText)) {
         lastErr = "consent wall";
         continue;
       }
+      const textCounts = pullCountsFrom(bodyText);
 
-      let counts = pullCountsFrom(bodyText);
-
-      // Late-hydrate retry
-      if (Object.values(counts).every((n) => !n)) {
-        await sleep(2000);
-        bodyText = (await page.evaluate(() => document.body.innerText)) || "";
-        counts = pullCountsFrom(bodyText);
-      }
+      // Merge: DOM wins for categories; text provides level/points
+      const merged = {
+        level: textCounts.level,
+        points: textCounts.points,
+        reviews: domCounts.reviews || textCounts.reviews || 0,
+        ratings: domCounts.ratings || textCounts.ratings || 0,
+        photos: domCounts.photos || textCounts.photos || 0,
+        edits: domCounts.edits || textCounts.edits || 0,
+        questions: domCounts.questions || textCounts.questions || 0,
+        facts: domCounts.facts || textCounts.facts || 0,
+        roadsAdded: domCounts.roadsAdded || textCounts.roadsAdded || 0,
+        placesAdded: domCounts.placesAdded || textCounts.placesAdded || 0,
+        listsPublished: domCounts.listsPublished || textCounts.listsPublished || 0
+      };
 
       await browser.close();
-      return { url, counts };
+      return { url, counts: merged };
     } catch (e) {
       lastErr = String(e);
       // try next candidate
@@ -239,34 +263,33 @@ async function scrapeCounts(contribUrl) {
   throw new Error(`Failed to parse profile (${lastErr || "unknown"})`);
 }
 
-/* ---------- routes ---------- */
+/* ------------------------------ routes ------------------------------ */
 
 app.get("/localguides/summary", async (req, res) => {
   const src = normalizeIdOrUrl(req.query.contrib_url);
   if (!src) {
     return res.status(400).json({
-      error: "Provide ?contrib_url=.../maps/contrib/<id> or just the numeric <id>",
+      error: "Provide ?contrib_url=.../maps/contrib/<id> or just the numeric <id>"
     });
   }
   try {
     const { url, counts } = await scrapeCounts(src);
-    const payload = {
+    return res.json({
       contribUrl: url,
       fetchedAt: new Date().toISOString(),
-      ...counts,
-    };
-    return res.json(payload);
+      ...counts
+    });
   } catch (e) {
     return res.status(422).json({ error: String(e) });
   }
 });
 
-// Minimal debug routes
+// Debug helpers (safe to keep during dev)
 app.get("/__whoami", (_req, res) => {
   res.json({
     node: process.version,
     execPathTried: findChromeBinary(),
-    cacheDirExists: fs.existsSync("/opt/render/project/src/.puppeteer-cache"),
+    cacheDirExists: fs.existsSync("/opt/render/project/src/.puppeteer-cache")
   });
 });
 
@@ -284,7 +307,7 @@ app.get("/__ls", (_req, res) => {
   }
 });
 
-// Peek rendered text (useful once if a profile keeps returning zeros)
+// Peek rendered text (if ever needed to tweak parsers)
 app.get("/localguides/debug", async (req, res) => {
   try {
     const src = normalizeIdOrUrl(req.query.contrib_url);
@@ -295,20 +318,13 @@ app.get("/localguides/debug", async (req, res) => {
     await page.setUserAgent(UA);
     await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
     await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
-    await page.goto(`${src}?hl=en&gl=us&authuser=0`, { waitUntil: "domcontentloaded", timeout: 90_000 });
-    await sleep(1200);
-    // Try to open the modal for debug as well
-    try {
-      await page.evaluate(() => {
-        const nodes = [...document.querySelectorAll('button, div[role="button"], a, div')];
-        const el = nodes.find(n => /Local Guide/i.test(n.innerText || ""));
-        if (el) el.click();
-      });
-      await sleep(600);
-    } catch {}
+    const url = `${src}?hl=en&gl=us&authuser=0`;
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await openStatsModal(page);
+    await sleep(800);
     const text = (await page.evaluate(() => document.body.innerText)) || "";
     await browser.close();
-    res.json({ sample: text.slice(0, 2000) });
+    res.json({ url, sample: text.slice(0, 2000) });
   } catch (e) {
     res.status(422).json({ error: String(e) });
   }
@@ -316,7 +332,7 @@ app.get("/localguides/debug", async (req, res) => {
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-/* ---------- start ---------- */
+/* ------------------------------ start ------------------------------ */
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`LG wrapper listening on :${PORT}`));
