@@ -3,9 +3,12 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.19.2",
-    "google-local-guides-api": "^1.0.3",
     "morgan": "^1.10.0",
-    "cors": "^2.8.5"
+    "playwright-chromium": "^1.47.2"
+  },
+  "scripts": {
+    "postinstall": "npx playwright install --with-deps chromium"
   }
 }
