@@ -34,11 +34,11 @@ function normalizeIdOrUrl(raw) {
 
 const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
 
-/** Text parser — used mainly for Level & Points and as a fallback */
+/** Text parser — mainly for Level & Points, and fallback */
 function pullCountsFrom(text) {
   const near = (label) => {
     const A = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
-    const B = new RegExp(`(?:${label})[\\s\\S]{0,100}?(\\d[\\d,\\.]*)`, "i");
+    const B = new RegExp(`(?:${label})[\\s\\S]{0,120}?(\\d[\\d,\\.]*)`, "i");
     const m = text.match(A) || text.match(B);
     return m ? toNum(m[1]) : 0;
   };
@@ -55,7 +55,6 @@ function pullCountsFrom(text) {
       return m ? toNum(m[1]) : 0;
     })();
 
-  // These may be 0 here; modal extraction will override
   return {
     level,
     points,
@@ -74,12 +73,10 @@ function pullCountsFrom(text) {
 /* --------------------- Chrome discovery & launch --------------------- */
 
 function findChromeBinary() {
-  // 1) manual override
   const override = process.env.PUPPETEER_EXECUTABLE_PATH;
   if (override) {
     try { fs.accessSync(override, fs.constants.X_OK); return override; } catch {}
   }
-  // 2) project cache on Render
   const ROOT = "/opt/render/project/src/.puppeteer-cache";
   const names = new Set(["chrome", "chrome-headless-shell", "Chromium"]);
   if (fs.existsSync(ROOT)) {
@@ -95,7 +92,6 @@ function findChromeBinary() {
       }
     }
   }
-  // 3) puppeteer’s own bundled path (if any)
   try {
     const p = puppeteer.executablePath();
     fs.accessSync(p, fs.constants.X_OK);
@@ -125,57 +121,124 @@ async function launchBrowser() {
   });
 }
 
-/* --------------------- DOM-first modal extraction --------------------- */
+/* --------------- modal open + deep (shadow DOM) extract --------------- */
 
+/** Click the points chip to open the stats modal. */
 async function openStatsModal(page) {
-  // Click the chip that opens the stats modal (your selector from the DOM dump)
+  // click the chip by jsaction/class
   const sel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
   const exists = await page.$(sel);
   if (exists) {
     await page.click(sel).catch(() => {});
   } else {
-    // Fallback: click any element whose text contains "points"
+    // Fallback: click any element with "points" in its text
     await page.evaluate(() => {
       const nodes = [...document.querySelectorAll('button,[role="button"],a,div,span')];
       const el = nodes.find(n => /points/i.test(n.textContent || ""));
       if (el) el.click();
     });
   }
-  // Wait briefly for modal rows to render
+  // wait for something that looks like the modal to appear
   try {
-    await page.waitForSelector(".QrGqBf .nKYSz", { timeout: 5000 });
+    await page.waitForFunction(
+      () => !!document.querySelector('.QrGqBf') ||
+            !!document.querySelector('[role="dialog"]') ||
+            !!document.querySelector('div[aria-modal="true"]'),
+      { timeout: 7000 }
+    );
     return true;
   } catch {
     return false;
   }
 }
 
+/** Recursively traverse shadow DOM to find rows and extract label/value. */
 async function extractCountsFromModal(page) {
   return await page.evaluate(() => {
     const toNum = v => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
+
+    function* walk(root) {
+      yield root;
+      const els = root.querySelectorAll ? root.querySelectorAll("*") : [];
+      for (const el of els) {
+        yield el;
+        if (el.shadowRoot) {
+          yield* walk(el.shadowRoot);
+        }
+      }
+    }
+
+    // Collect row containers that have either of the class tokens we saw
+    const rows = [];
+    for (const node of walk(document)) {
+      const cls = (node.className || "").toString();
+      if (/\bnKYSz\b/.test(cls)) rows.push(node);
+      // Some builds wrap rows without nKYSz; catch label/value pairs too
+    }
+
+    // Helper: find first match under a root, searching into shadow DOM too
+    function findTextDeep(root, selector) {
+      // direct
+      const direct = root.querySelector?.(selector);
+      if (direct) return (direct.textContent || "").trim();
+      // deep
+      for (const el of root.querySelectorAll?.("*") || []) {
+        if (el.matches?.(selector)) return (el.textContent || "").trim();
+        if (el.shadowRoot) {
+          const t = findTextDeep(el.shadowRoot, selector);
+          if (t) return t;
+        }
+      }
+      return "";
+    }
+
     const out = {
       reviews: 0, ratings: 0, photos: 0, edits: 0, questions: 0, facts: 0,
       roadsAdded: 0, placesAdded: 0, listsPublished: 0
     };
-    const rows = Array.from(document.querySelectorAll(".QrGqBf .nKYSz"));
+
+    // Primary: rows with clear label/value spans
     for (const r of rows) {
-      const label = (r.querySelector(".FM5HI")?.textContent || "").trim().toLowerCase();
-      const value = toNum(r.querySelector(".AyEQdd")?.textContent || "0");
+      const label = (findTextDeep(r, ".FM5HI") || "").toLowerCase();
+      const value = toNum(findTextDeep(r, ".AyEQdd") || "0");
       switch (label) {
         case "reviews": out.reviews = value; break;
         case "ratings": out.ratings = value; break;
         case "photos": out.photos = value; break;
-        case "videos": /* not in schema */ break;
-        case "captions": /* not in schema */ break;
+        case "videos": /* ignore */ break;
+        case "captions": /* ignore */ break;
         case "answers": out.questions = value; break;
         case "edits": out.edits = value; break;
         case "reported incorrect": out.facts = Math.max(out.facts, value); break;
         case "facts checked": out.facts = Math.max(out.facts, value); break;
         case "places added": out.placesAdded = value; break;
         case "roads added": out.roadsAdded = value; break;
-        case "q&a": /* ignore for now */ break;
+        case "q&a": /* ignore */ break;
       }
     }
+
+    // Fallback: if we didn’t find rows, scan all text for pairs seen in modal
+    if (
+      !out.reviews && !out.photos && !out.edits && !out.questions &&
+      !out.facts && !out.placesAdded && !out.roadsAdded && !out.ratings
+    ) {
+      const dense = (document.body.innerText || "").replace(/\s+/g, " ");
+      function near(label) {
+        const A = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
+        const B = new RegExp(`(?:${label})\\s*(\\d[\\d,\\.]*)`, "i");
+        const m = dense.match(A) || dense.match(B);
+        return m ? toNum(m[1]) : 0;
+      }
+      out.reviews     = near("Reviews?");
+      out.ratings     = near("Ratings?");
+      out.photos      = near("Photos?");
+      out.edits       = near("Edits?");
+      out.questions   = near("Answers?");
+      out.facts       = Math.max(near("Reported\\s+incorrect"), near("Facts?\\s*checked"));
+      out.placesAdded = near("Places\\s+added");
+      out.roadsAdded  = near("Roads\\s+added");
+    }
+
     return out;
   });
 }
@@ -195,12 +258,12 @@ async function scrapeCounts(contribUrl) {
   // Avoid consent wall
   await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
 
-  // Block heavy assets
+  // Block heavy assets (allow CSS so layout stays sane)
   if (page.setRequestInterception) {
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const t = req.resourceType();
-      if (t === "image" || t === "media" || t === "font" || t === "stylesheet") return req.abort();
+      if (t === "image" || t === "media" || t === "font") return req.abort();
       req.continue();
     });
   }
@@ -218,17 +281,16 @@ async function scrapeCounts(contribUrl) {
 
       // open the Local Guide stats modal
       await openStatsModal(page);
-
-      // small hydration nudges
+      // hydrate a bit
       for (let i = 0; i < 2; i++) {
-        await page.evaluate((y) => window.scrollTo(0, y), 350 * (i + 1));
+        await page.evaluate((y) => window.scrollTo(0, y), 400 * (i + 1));
         await sleep(600);
       }
 
-      // Prefer DOM extraction from the modal for per-category
+      // DOM-first extraction from modal rows (with deep shadow traversal)
       const domCounts = await extractCountsFromModal(page);
 
-      // Always parse text for Level/Points (+ fallback if modal missed something)
+      // Always parse text for Level/Points (+ safety fallback)
       let bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       if (/Before you continue to Google/i.test(bodyText)) {
         lastErr = "consent wall";
@@ -284,7 +346,7 @@ app.get("/localguides/summary", async (req, res) => {
   }
 });
 
-// Debug helpers (safe to keep during dev)
+// Debug helpers
 app.get("/__whoami", (_req, res) => {
   res.json({
     node: process.version,
@@ -307,7 +369,6 @@ app.get("/__ls", (_req, res) => {
   }
 });
 
-// Peek rendered text (if ever needed to tweak parsers)
 app.get("/localguides/debug", async (req, res) => {
   try {
     const src = normalizeIdOrUrl(req.query.contrib_url);
