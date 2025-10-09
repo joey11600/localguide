@@ -1,7 +1,7 @@
+import puppeteer from "puppeteer";
 import express from "express";
 import morgan from "morgan";
 import cors from "cors";
-import puppeteer from "puppeteer";
 
 const app = express();
 app.use(cors());
