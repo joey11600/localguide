@@ -136,53 +136,120 @@ async function scrapeCounts(contribUrl) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
 
+  // Speed + stability
   await page.setUserAgent(UA);
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+  await page.setDefaultNavigationTimeout(90_000);
+  await page.setDefaultTimeout(45_000);
 
   // Avoid consent interstitials (Puppeteer uses page.setCookie)
-  await page.setCookie({
-    name: "CONSENT",
-    value: "YES+cb",
-    domain: ".google.com",
-    path: "/",
+  await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
+
+  // Block heavy assets; keep XHR/fetch alive
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    const type = req.resourceType();
+    if (type === "image" || type === "media" || type === "font" || type === "stylesheet") {
+      return req.abort();
+    }
+    req.continue();
   });
 
+  // Two URL variants hydrate different shells
   const candidates = [
-    `${contribUrl}?hl=en&gl=us`,
-    `${contribUrl}/reviews?hl=en&gl=us`,
+    `${contribUrl}?hl=en&gl=us&authuser=0`,
+    `${contribUrl}/reviews?hl=en&gl=us&authuser=0`,
   ];
+
+  // Parser (same as before)
+  const parseText = (text) => {
+    const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
+    const near = (label) => {
+      const A = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
+      const B = new RegExp(`(?:${label})[^\\d]{0,80}(\\d[\\d,\\.]*)`, "i");
+      const m = text.match(A) || text.match(B);
+      return m ? toNum(m[1]) : 0;
+    };
+    const levelMatch =
+      /Local Guide[^]{0,220}Level\s*(\d+)/i.exec(text) ||
+      /Local Guide[^]{0,220}[•·]\s*Level\s*(\d+)/i.exec(text);
+    const level = levelMatch ? toNum(levelMatch[1]) : 0;
+
+    const points =
+      near("(?:points|pts)") ||
+      (() => {
+        const m = /(\d[\d,\.]*)\s*(?:point|pts)\b/i.exec(text);
+        return m ? toNum(m[1]) : 0;
+      })();
+
+    return {
+      level,
+      points,
+      reviews: near("review[s]?"),
+      ratings: near("rating[s]?"),
+      photos: near("photo[s]?|video[s]?"),
+      edits: near("edit[s]?"),
+      questions: near("question[s]?"),
+      facts: near("fact[s]?"),
+      roadsAdded: near("road[s]? added"),
+      placesAdded: near("place[s]? added"),
+      listsPublished: near("list[s]? published"),
+    };
+  };
 
   let lastErr = null;
 
   for (const url of candidates) {
     try {
-      await page.goto(url, { waitUntil: "networkidle0", timeout: 45000 });
+      // Don’t rely on networkidle; it’s sticky on Maps. Use DOMContentLoaded + content wait.
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
 
-      // Nudge hydration / lazy sections
+      // Let client scripts run and populate text; nudge scroll to trigger lazy bits.
       for (let i = 0; i < 3; i++) {
-        await page.evaluate((y) => window.scrollTo(0, y), 300 * (i + 1));
+        await page.evaluate((y) => window.scrollTo(0, y), 350 * (i + 1));
         await page.waitForTimeout(700);
       }
 
+      // Wait until the body text looks like the real profile (or time out)
+      try {
+        await page.waitForFunction(
+          () => {
+            const t = document.body.innerText || "";
+            const dense = t.replace(/\s+/g, " ").trim();
+            // Heuristics: look for LG or obvious counters
+            return (
+              /Local Guide/i.test(dense) ||
+              /\breviews?\b/i.test(dense) ||
+              /\bpoints?\b/i.test(dense)
+            );
+          },
+          { timeout: 20_000, polling: 500 }
+        );
+      } catch {
+        // continue anyway; we’ll parse whatever we have
+      }
+
+      // Pull visible text and parse
       let bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       if (/Before you continue to Google/i.test(bodyText)) {
         lastErr = "consent wall";
         continue;
       }
 
-      let counts = pullCountsFrom(bodyText);
+      let counts = parseText(bodyText);
 
       // Late hydration retry
       if (Object.values(counts).every((n) => !n)) {
         await page.waitForTimeout(2000);
         bodyText = (await page.evaluate(() => document.body.innerText)) || "";
-        counts = pullCountsFrom(bodyText);
+        counts = parseText(bodyText);
       }
 
       await browser.close();
       return { url, counts };
     } catch (e) {
       lastErr = String(e);
+      // try next candidate
     }
   }
 
