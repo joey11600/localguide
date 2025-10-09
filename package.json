@@ -9,6 +9,9 @@
     "puppeteer": "^23.6.1"
   },
   "scripts": {
-    "postinstall": "PUPPETEER_CACHE_DIR=./.puppeteer-cache npx puppeteer browsers install chrome"
+    "postinstall": "PUPPETEER_CACHE_DIR=/opt/render/project/src/.puppeteer-cache npx puppeteer install chrome@stable --platform=linux"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
