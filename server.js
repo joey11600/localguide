@@ -57,6 +57,7 @@ function pullCountsFrom(text) {
 async function scrapeCounts(contribUrl) {
   const browser = await puppeteer.launch({
     headless: "new",
+    executablePath: puppeteer.executablePath(),   // <-- add this line
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
   const ctx = await browser.createBrowserContext();
