@@ -55,8 +55,12 @@ function pullCountsFrom(text) {
 }
 
 async function scrapeCounts(contribUrl) {
+  // Try the local cache path first
+  const localChrome = "./.puppeteer-cache/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
   const chromePath =
-    process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath();
+    (await import("fs")).existsSync(localChrome)
+      ? localChrome
+      : puppeteer.executablePath();
 
   const browser = await puppeteer.launch({
     headless: "new",
