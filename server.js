@@ -1,3 +1,10 @@
+// server.js
+// Render settings:
+//   Build Command: npm install && PUPPETEER_CACHE_DIR=/opt/render/project/src/.puppeteer-cache npx puppeteer browsers install chrome --platform=linux
+//   Start Command: node ./server.js
+//   Env: NODE_VERSION=20
+//   Root Directory: (blank) or "."
+
 import express from "express";
 import morgan from "morgan";
 import cors from "cors";
@@ -28,14 +35,14 @@ const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) ||
 function pullCountsFrom(text) {
   const near = (label) => {
     const reA = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
-    const reB = new RegExp(`(?:${label})[^\\d]{0,40}(\\d[\\d,\\.]*)`, "i");
+    const reB = new RegExp(`(?:${label})[^\\d]{0,60}(\\d[\\d,\\.]*)`, "i");
     const m = text.match(reA) || text.match(reB);
     return m ? toNum(m[1]) : 0;
   };
 
   const levelMatch =
-    /Local Guide[^]{0,160}Level\s*(\d+)/i.exec(text) ||
-    /Local Guide[^]{0,160}[•·]\s*Level\s*(\d+)/i.exec(text);
+    /Local Guide[^]{0,200}Level\s*(\d+)/i.exec(text) ||
+    /Local Guide[^]{0,200}[•·]\s*Level\s*(\d+)/i.exec(text);
   const level = levelMatch ? toNum(levelMatch[1]) : 0;
 
   const points =
@@ -60,17 +67,18 @@ function pullCountsFrom(text) {
   };
 }
 
-/** Search for a Chrome/Chromium binary installed during build. */
+// Recursively find a Chrome/Chromium binary under the cache dir or puppeteer path.
 function findChromeBinary() {
-  // 1) Respect manual override if present
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+  // 1) Manual override if provided
+  const override = process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (override) {
     try {
-      fs.accessSync(process.env.PUPPETEER_EXECUTABLE_PATH, fs.constants.X_OK);
-      return process.env.PUPPETEER_EXECUTABLE_PATH;
+      fs.accessSync(override, fs.constants.X_OK);
+      return override;
     } catch {}
   }
 
-  // 2) Project-persistent cache (recommended)
+  // 2) Our project-persistent cache on Render
   const ROOT = "/opt/render/project/src/.puppeteer-cache";
   const names = new Set(["chrome", "chrome-headless-shell", "Chromium"]);
   if (fs.existsSync(ROOT)) {
@@ -104,7 +112,7 @@ async function launchBrowser() {
   const execPath = findChromeBinary();
   if (!execPath) {
     throw new Error(
-      "Chrome/Chromium not found. Ensure your build installs a browser (e.g., postinstall: `npx puppeteer install chrome`)."
+      "Chrome/Chromium not found. Build must run: `npx puppeteer browsers install chrome --platform=linux`"
     );
   }
   return puppeteer.launch({
@@ -121,15 +129,23 @@ async function launchBrowser() {
   });
 }
 
+/* ---------- core scraping ---------- */
+
 async function scrapeCounts(contribUrl) {
   const browser = await launchBrowser();
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
+
   await page.setUserAgent(UA);
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-  // Avoid consent interstitials
-  await ctx.addCookies([{ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" }]);
+  // Avoid consent interstitials (Puppeteer uses page.setCookie)
+  await page.setCookie({
+    name: "CONSENT",
+    value: "YES+cb",
+    domain: ".google.com",
+    path: "/",
+  });
 
   const candidates = [
     `${contribUrl}?hl=en&gl=us`,
@@ -140,15 +156,15 @@ async function scrapeCounts(contribUrl) {
 
   for (const url of candidates) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.goto(url, { waitUntil: "networkidle0", timeout: 45000 });
 
-      // Let the page hydrate; nudge scroll to trigger lazy bits.
-      await page.waitForTimeout(1800);
-      await page.evaluate(() => window.scrollTo(0, 400));
-      await page.waitForTimeout(800);
+      // Nudge hydration / lazy sections
+      for (let i = 0; i < 3; i++) {
+        await page.evaluate((y) => window.scrollTo(0, y), 300 * (i + 1));
+        await page.waitForTimeout(700);
+      }
 
-      // Quick consent-wall check
-      const bodyText = (await page.evaluate(() => document.body.innerText)) || "";
+      let bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       if (/Before you continue to Google/i.test(bodyText)) {
         lastErr = "consent wall";
         continue;
@@ -156,11 +172,11 @@ async function scrapeCounts(contribUrl) {
 
       let counts = pullCountsFrom(bodyText);
 
-      // If all zeros, wait a bit and try again
+      // Late hydration retry
       if (Object.values(counts).every((n) => !n)) {
-        await page.waitForTimeout(1500);
-        const bodyText2 = (await page.evaluate(() => document.body.innerText)) || "";
-        counts = pullCountsFrom(bodyText2);
+        await page.waitForTimeout(2000);
+        bodyText = (await page.evaluate(() => document.body.innerText)) || "";
+        counts = pullCountsFrom(bodyText);
       }
 
       await browser.close();
@@ -195,7 +211,7 @@ app.get("/localguides/summary", async (req, res) => {
   }
 });
 
-// Minimal debug: show where we think Chrome lives (no secrets leaked)
+// Minimal debug routes (useful once, then you can remove)
 app.get("/__whoami", (_req, res) => {
   res.json({
     node: process.version,
@@ -204,7 +220,6 @@ app.get("/__whoami", (_req, res) => {
   });
 });
 
-// (Optional) quick peek at cache tree head for troubleshooting
 app.get("/__ls", (_req, res) => {
   try {
     if (!fs.existsSync("/opt/render/project/src/.puppeteer-cache")) {
@@ -216,6 +231,33 @@ app.get("/__ls", (_req, res) => {
     res.type("text/plain").send(out);
   } catch (e) {
     res.status(500).type("text/plain").send(String(e));
+  }
+});
+
+// Rendered-text peek to tune regexes if needed
+app.get("/localguides/debug", async (req, res) => {
+  try {
+    const src = normalizeIdOrUrl(req.query.contrib_url);
+    if (!src) return res.status(400).json({ error: "Missing ?contrib_url" });
+    const browser = await launchBrowser();
+    const ctx = await browser.createBrowserContext();
+    const page = await ctx.newPage();
+    await page.setUserAgent(UA);
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+    await page.setCookie({
+      name: "CONSENT",
+      value: "YES+cb",
+      domain: ".google.com",
+      path: "/",
+    });
+    const url = `${src}?hl=en&gl=us`;
+    await page.goto(url, { waitUntil: "networkidle0", timeout: 45000 });
+    await page.waitForTimeout(1200);
+    const text = (await page.evaluate(() => document.body.innerText)) || "";
+    await browser.close();
+    res.json({ url, sample: text.slice(0, 2000) });
+  } catch (e) {
+    res.status(422).json({ error: String(e) });
   }
 });
 
