@@ -132,6 +132,8 @@ async function launchBrowser() {
 /* ---------- core scraping ---------- */
 
 async function scrapeCounts(contribUrl) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   const browser = await launchBrowser();
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
@@ -139,29 +141,27 @@ async function scrapeCounts(contribUrl) {
   // Speed + stability
   await page.setUserAgent(UA);
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-  await page.setDefaultNavigationTimeout(90_000);
-  await page.setDefaultTimeout(45_000);
+  page.setDefaultNavigationTimeout?.(90_000);
+  page.setDefaultTimeout?.(45_000);
 
-  // Avoid consent interstitials (Puppeteer uses page.setCookie)
+  // Avoid consent interstitials (set cookie on the page)
   await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
 
   // Block heavy assets; keep XHR/fetch alive
-  await page.setRequestInterception(true);
-  page.on("request", (req) => {
-    const type = req.resourceType();
-    if (type === "image" || type === "media" || type === "font" || type === "stylesheet") {
-      return req.abort();
-    }
-    req.continue();
-  });
+  if (page.setRequestInterception) {
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const t = req.resourceType();
+      if (t === "image" || t === "media" || t === "font" || t === "stylesheet") return req.abort();
+      req.continue();
+    });
+  }
 
-  // Two URL variants hydrate different shells
   const candidates = [
     `${contribUrl}?hl=en&gl=us&authuser=0`,
     `${contribUrl}/reviews?hl=en&gl=us&authuser=0`,
   ];
 
-  // Parser (same as before)
   const parseText = (text) => {
     const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
     const near = (label) => {
@@ -201,35 +201,27 @@ async function scrapeCounts(contribUrl) {
 
   for (const url of candidates) {
     try {
-      // Don’t rely on networkidle; it’s sticky on Maps. Use DOMContentLoaded + content wait.
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
 
-      // Let client scripts run and populate text; nudge scroll to trigger lazy bits.
+      // Nudge hydration/lazy sections
       for (let i = 0; i < 3; i++) {
         await page.evaluate((y) => window.scrollTo(0, y), 350 * (i + 1));
-        await page.waitForTimeout(700);
+        await sleep(700);
       }
 
-      // Wait until the body text looks like the real profile (or time out)
+      // Content-based wait (don’t rely on networkidle)
       try {
         await page.waitForFunction(
           () => {
-            const t = document.body.innerText || "";
-            const dense = t.replace(/\s+/g, " ").trim();
-            // Heuristics: look for LG or obvious counters
-            return (
-              /Local Guide/i.test(dense) ||
-              /\breviews?\b/i.test(dense) ||
-              /\bpoints?\b/i.test(dense)
-            );
+            const t = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+            return /Local Guide/i.test(t) || /\breviews?\b/i.test(t) || /\bpoints?\b/i.test(t);
           },
           { timeout: 20_000, polling: 500 }
         );
       } catch {
-        // continue anyway; we’ll parse whatever we have
+        // carry on; we’ll parse whatever we have
       }
 
-      // Pull visible text and parse
       let bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       if (/Before you continue to Google/i.test(bodyText)) {
         lastErr = "consent wall";
@@ -238,9 +230,9 @@ async function scrapeCounts(contribUrl) {
 
       let counts = parseText(bodyText);
 
-      // Late hydration retry
+      // Late hydrate retry
       if (Object.values(counts).every((n) => !n)) {
-        await page.waitForTimeout(2000);
+        await sleep(2000);
         bodyText = (await page.evaluate(() => document.body.innerText)) || "";
         counts = parseText(bodyText);
       }
