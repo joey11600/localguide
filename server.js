@@ -55,9 +55,12 @@ function pullCountsFrom(text) {
 }
 
 async function scrapeCounts(contribUrl) {
+  const chromePath =
+    process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath();
+
   const browser = await puppeteer.launch({
     headless: "new",
-    executablePath: puppeteer.executablePath(),   // <-- add this line
+    executablePath: chromePath,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
   const ctx = await browser.createBrowserContext();
