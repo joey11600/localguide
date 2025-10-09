@@ -55,12 +55,13 @@ function pullCountsFrom(text) {
 }
 
 async function scrapeCounts(contribUrl) {
-  // Try the local cache path first
-  const localChrome = "./.puppeteer-cache/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
-  const chromePath =
-    (await import("fs")).existsSync(localChrome)
-      ? localChrome
-      : puppeteer.executablePath();
+  const fs = await import("fs");
+  const localChrome =
+    "/opt/render/project/src/.puppeteer-cache/chrome/linux-131.0.6778.204/chrome-linux64/chrome";
+
+  const chromePath = fs.existsSync(localChrome)
+    ? localChrome
+    : puppeteer.executablePath();
 
   const browser = await puppeteer.launch({
     headless: "new",
