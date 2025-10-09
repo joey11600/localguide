@@ -1,11 +1,14 @@
 import express from "express";
 import morgan from "morgan";
 import cors from "cors";
-import { chromium } from "playwright-chromium";
+import puppeteer from "puppeteer";
 
 const app = express();
 app.use(cors());
 app.use(morgan("tiny"));
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 function normalizeIdOrUrl(raw) {
   const r = String(raw || "").trim();
@@ -15,112 +18,112 @@ function normalizeIdOrUrl(raw) {
   return null;
 }
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
 
-async function getCountsWithBrowser(contribUrl) {
-  const browser = await chromium.launch({
+function pullCountsFrom(text) {
+  const near = (label) => {
+    const reA = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
+    const reB = new RegExp(`(?:${label})[^\\d]{0,40}(\\d[\\d,\\.]*)`, "i");
+    const m = text.match(reA) || text.match(reB);
+    return m ? toNum(m[1]) : 0;
+  };
+  const levelMatch =
+    /Local Guide[^]{0,120}Level\s*(\d+)/i.exec(text) ||
+    /Local Guide[^]{0,120}[•·]\s*Level\s*(\d+)/i.exec(text);
+  const level = levelMatch ? toNum(levelMatch[1]) : 0;
+
+  const points =
+    near("(?:points|pts)") ||
+    (() => {
+      const m = /(\d[\d,\.]*)\s*(?:point|pts)\b/i.exec(text);
+      return m ? toNum(m[1]) : 0;
+    })();
+
+  return {
+    level,
+    points,
+    reviews: near("review[s]?"),
+    ratings: near("rating[s]?"),
+    photos: near("photo[s]?|video[s]?"),
+    edits: near("edit[s]?"),
+    questions: near("question[s]?"),
+    facts: near("fact[s]?"),
+    roadsAdded: near("road[s]? added"),
+    placesAdded: near("place[s]? added"),
+    listsPublished: near("list[s]? published")
+  };
+}
+
+async function scrapeCounts(contribUrl) {
+  const browser = await puppeteer.launch({
+    headless: "new",
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
-  const ctx = await browser.newContext({
-    userAgent: UA,
-    locale: "en-US",
-  });
+  const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
+  await page.setUserAgent(UA);
+  await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-  // Add a consent cookie to avoid interstitials when possible
-  await ctx.addCookies([
+  // Avoid consent wall
+  const cookies = [
     { name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" }
-  ]);
+  ];
+  await ctx.overridePermissions("https://www.google.com", []); // no geolocation prompts
+  await page.setCookie(...cookies);
 
-  // try main page; if needed, try /reviews
   const candidates = [
-    contribUrl,
-    `${contribUrl}/reviews?hl=en&gl=us`,
-    `${contribUrl}?hl=en&gl=us`
+    `${contribUrl}?hl=en&gl=us`,
+    `${contribUrl}/reviews?hl=en&gl=us`
   ];
 
   let lastErr = null;
-  for (const u of candidates) {
+  for (const url of candidates) {
     try {
-      await page.goto(u, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      // give it time to hydrate
+      await page.waitForTimeout(1800);
 
-      // Wait a bit for the contribution panel to hydrate
-      await page.waitForTimeout(1500);
+      // Try to force the Contributions panel visible by small scroll
+      await page.evaluate(() => window.scrollTo(0, 400));
+      await page.waitForTimeout(600);
 
-      // Heuristics: get full text and fish out numbers around labels
-      const bodyText = await page.textContent("body");
-      if (!bodyText) throw new Error("Empty body text");
+      // Pull all text and parse
+      const bodyText = (await page.evaluate(() => document.body.innerText)) || "";
+      const counts = pullCountsFrom(bodyText);
 
-      const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
-
-      const near = (label) => {
-        const reA = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
-        const reB = new RegExp(`(?:${label})[^\\d]{0,40}(\\d[\\d,\\.]*)`, "i");
-        const m = bodyText.match(reA) || bodyText.match(reB);
-        return m ? toNum(m[1]) : 0;
-      };
-
-      // Level often appears as "Local Guide · Level X"
-      const levelMatch =
-        /Local Guide[^]{0,80}Level\s*(\d+)/i.exec(bodyText) ||
-        /Local Guide[^]{0,80}[•·]\s*Level\s*(\d+)/i.exec(bodyText);
-      const level = levelMatch ? toNum(levelMatch[1]) : 0;
-
-      const points =
-        near("(?:points|pts)") ||
-        (() => {
-          const m = /(\d[\d,\.]*)\s*(?:point|pts)\b/i.exec(bodyText);
-          return m ? toNum(m[1]) : 0;
-        })();
-
-      const counts = {
-        level,
-        points,
-        reviews: near("review[s]?"),
-        ratings: near("rating[s]?"),
-        photos: near("photo[s]?|video[s]?"),
-        edits: near("edit[s]?"),
-        questions: near("question[s]?"),
-        facts: near("fact[s]?"),
-        roadsAdded: near("road[s]? added"),
-        placesAdded: near("place[s]? added"),
-        listsPublished: near("list[s]? published")
-      };
-
-      // If everything is zero, try clicking the "Contributions" tab area (if visible)
-      const allZero = Object.values(counts).every(n => !n);
-      if (allZero) {
-        // sometimes counts render after a tiny delay
+      // If all zero, wait a bit more and try body text again
+      if (Object.values(counts).every((n) => !n)) {
         await page.waitForTimeout(1500);
-        const bodyText2 = await page.textContent("body");
-        if (bodyText2) {
-          const reA = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:points|pts)`, "i");
-          const mm = bodyText2.match(reA);
-          if (mm) counts.points = toNum(mm[1]);
+        const bodyText2 = (await page.evaluate(() => document.body.innerText)) || "";
+        const counts2 = pullCountsFrom(bodyText2);
+        if (!Object.values(counts2).every((n) => !n)) {
+          await browser.close();
+          return { url, counts: counts2, dbg: bodyText2.slice(0, 500) };
         }
+      } else {
+        await browser.close();
+        return { url, counts, dbg: bodyText.slice(0, 500) };
       }
 
-      await browser.close();
-      return { url: u, counts };
+      lastErr = "Parsed but zeros after hydration";
     } catch (e) {
       lastErr = e;
-      // try next candidate
     }
   }
 
   await browser.close();
-  const err = new Error(`Failed to render profile (${String(lastErr)})`);
-  err.code = "RENDER_FAIL";
-  throw err;
+  throw new Error(`Failed to parse profile: ${String(lastErr)}`);
 }
 
 app.get("/localguides/summary", async (req, res) => {
   const src = normalizeIdOrUrl(req.query.contrib_url);
-  if (!src) return res.status(400).json({ error: "Provide ?contrib_url=.../maps/contrib/<id> or the numeric ID" });
-
+  if (!src) {
+    return res.status(400).json({
+      error: "Provide ?contrib_url=.../maps/contrib/<id> or the numeric ID"
+    });
+  }
   try {
-    const { url, counts } = await getCountsWithBrowser(src);
+    const { url, counts } = await scrapeCounts(src);
     return res.json({
       contribUrl: url,
       fetchedAt: new Date().toISOString(),
@@ -128,6 +131,18 @@ app.get("/localguides/summary", async (req, res) => {
     });
   } catch (e) {
     return res.status(422).json({ error: String(e) });
+  }
+});
+
+// Optional debug: shows a tiny snippet of the text we parsed
+app.get("/localguides/debug", async (req, res) => {
+  const src = normalizeIdOrUrl(req.query.contrib_url);
+  if (!src) return res.status(400).json({ error: "Missing ?contrib_url" });
+  try {
+    const { url, counts, dbg } = await scrapeCounts(src);
+    res.json({ triedUrl: url, counts, textSample: dbg });
+  } catch (e) {
+    res.status(422).json({ error: String(e) });
   }
 });
 
