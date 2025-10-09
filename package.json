@@ -6,6 +6,9 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "morgan": "^1.10.0",
-    "puppeteer": "^23.4.1"
+    "puppeteer": "^23.6.1"
+  },
+  "scripts": {
+    "postinstall": "npx puppeteer browsers install chrome"
   }
 }
