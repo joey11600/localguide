@@ -1,0 +1,11 @@
+{
+  "name": "local-guides-wrapper",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "google-local-guides-api": "^1.0.3",
+    "morgan": "^1.10.0",
+    "cors": "^2.8.5"
+  }
+}
