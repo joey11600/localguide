@@ -1,140 +1,134 @@
 import express from "express";
 import morgan from "morgan";
 import cors from "cors";
-
-// Use a desktop-ish user agent to avoid lightweight shells
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-const BASE_HEADERS = {
-  "User-Agent": UA,
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-};
+import { chromium } from "playwright-chromium";
 
 const app = express();
 app.use(cors());
 app.use(morgan("tiny"));
 
-// ------- helpers
-function buildVariants(raw) {
-  const base = String(raw).trim().replace(/\/+$/, "");
-  const u0 = base.includes("google.com/maps/contrib/")
-    ? base
-    : `https://www.google.com/maps/contrib/${base}`;
-  const addLocale = (u) => (u.includes("?") ? `${u}&hl=en&gl=us` : `${u}?hl=en&gl=us`);
-  return [u0, `${u0}/reviews`, addLocale(u0), addLocale(`${u0}/reviews`)];
+function normalizeIdOrUrl(raw) {
+  const r = String(raw || "").trim();
+  if (!r) return null;
+  if (/^\d{10,}$/.test(r)) return `https://www.google.com/maps/contrib/${r}`;
+  if (r.includes("google.com/maps/contrib/")) return r.replace(/\/+$/, "");
+  return null;
 }
 
-async function fetchHtml(url) {
-  const res = await fetch(url, { headers: BASE_HEADERS, redirect: "follow" });
-  if (!res.ok) throw new Error(`Fetch failed ${res.status}`);
-  const text = await res.text();
-  return { finalUrl: res.url || url, html: text };
-}
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
-
-// crude-but-robust text scraping with multiple fallbacks
-function parseCounts(html) {
-  const find = (label) => {
-    let m =
-      new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i").exec(html) ||
-      new RegExp(`(?:${label})[^\\d]{0,40}(\\d[\\d,\\.]*)`, "i").exec(html);
-    return m ? toNum(m[1]) : 0;
-  };
-
-  // "Local Guide • Level X" patterns
-  let levelMatch =
-    /Local Guide[^<]{0,60}Level\s*(\d+)/i.exec(html) ||
-    /Local Guide[^<]{0,60}[•·]\s*Level\s*(\d+)/i.exec(html);
-  const level = levelMatch ? toNum(levelMatch[1]) : 0;
-
-  const points =
-    find("(?:points|pts)") ||
-    (() => {
-      const m = /(\d[\d,\.]*)\s*(?:point|pts)\b/i.exec(html);
-      return m ? toNum(m[1]) : 0;
-    })();
-
-  const reviews = find("review[s]?");
-  const ratings = find("rating[s]?");
-  const photos = find("photo[s]?|video[s]?");
-  const edits = find("edit[s]?");
-  const questions = find("question[s]?");
-  const facts = find("fact[s]?");
-  const roadsAdded = find("road[s]? added");
-  const placesAdded = find("place[s]? added");
-  const listsPublished = find("list[s]? published");
-
-  return { level, points, reviews, ratings, photos, edits, questions, facts, roadsAdded, placesAdded, listsPublished };
-}
-
-// ------- endpoints
-
-// Main summary endpoint Base44 will call
-app.get("/localguides/summary", async (req, res) => {
-  const raw = String(req.query.contrib_url || "").trim();
-  if (!raw) return res.status(400).json({ error: "Missing ?contrib_url" });
-  if (!raw.includes("google.com/maps/contrib/") && !/^\d{10,}$/.test(raw)) {
-    return res.status(400).json({ error: "Provide a full Maps contrib URL or numeric ID" });
-  }
-
-  const variants = buildVariants(raw);
-  let lastErr = null;
-
-  for (const u of variants) {
-    try {
-      const { finalUrl, html } = await fetchHtml(u);
-
-      // skip consent pages
-      if (/Before you continue to Google/i.test(html) || /consent/i.test(html)) {
-        lastErr = "Hit consent page";
-        continue;
-      }
-
-      const counts = parseCounts(html);
-      const allZero = Object.values(counts).every((n) => !n);
-
-      // log a tiny snippet for debugging in Render Logs
-      console.log("[LG] URL:", finalUrl);
-      console.log("[LG] Counts:", counts);
-      console.log("[LG] Snippet:", html.slice(0, 200).replace(/\s+/g, " "));
-
-      if (!allZero) {
-        return res.json({ contribUrl: finalUrl, fetchedAt: new Date().toISOString(), ...counts });
-      }
-      lastErr = "Parsed but all zeros";
-    } catch (e) {
-      lastErr = String(e);
-    }
-  }
-
-  return res.status(422).json({
-    error:
-      "Could not parse profile (private/empty/consent wall or markup change). " +
-      `Last note: ${lastErr}`
+async function getCountsWithBrowser(contribUrl) {
+  const browser = await chromium.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
-});
+  const ctx = await browser.newContext({
+    userAgent: UA,
+    locale: "en-US",
+  });
+  const page = await ctx.newPage();
 
-// Debug endpoint so we can see what HTML you actually receive
-app.get("/localguides/debug", async (req, res) => {
-  const raw = String(req.query.contrib_url || "").trim();
-  if (!raw) return res.status(400).json({ error: "Missing ?contrib_url" });
+  // Add a consent cookie to avoid interstitials when possible
+  await ctx.addCookies([
+    { name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" }
+  ]);
 
-  const variants = buildVariants(raw);
-  for (const u of variants) {
+  // try main page; if needed, try /reviews
+  const candidates = [
+    contribUrl,
+    `${contribUrl}/reviews?hl=en&gl=us`,
+    `${contribUrl}?hl=en&gl=us`
+  ];
+
+  let lastErr = null;
+  for (const u of candidates) {
     try {
-      const { finalUrl, html } = await fetchHtml(u);
-      return res.json({
-        triedUrl: u,
-        finalUrl,
-        htmlSample: html.slice(0, 4000) // first 4k chars is enough to tune
-      });
+      await page.goto(u, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+      // Wait a bit for the contribution panel to hydrate
+      await page.waitForTimeout(1500);
+
+      // Heuristics: get full text and fish out numbers around labels
+      const bodyText = await page.textContent("body");
+      if (!bodyText) throw new Error("Empty body text");
+
+      const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
+
+      const near = (label) => {
+        const reA = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
+        const reB = new RegExp(`(?:${label})[^\\d]{0,40}(\\d[\\d,\\.]*)`, "i");
+        const m = bodyText.match(reA) || bodyText.match(reB);
+        return m ? toNum(m[1]) : 0;
+      };
+
+      // Level often appears as "Local Guide · Level X"
+      const levelMatch =
+        /Local Guide[^]{0,80}Level\s*(\d+)/i.exec(bodyText) ||
+        /Local Guide[^]{0,80}[•·]\s*Level\s*(\d+)/i.exec(bodyText);
+      const level = levelMatch ? toNum(levelMatch[1]) : 0;
+
+      const points =
+        near("(?:points|pts)") ||
+        (() => {
+          const m = /(\d[\d,\.]*)\s*(?:point|pts)\b/i.exec(bodyText);
+          return m ? toNum(m[1]) : 0;
+        })();
+
+      const counts = {
+        level,
+        points,
+        reviews: near("review[s]?"),
+        ratings: near("rating[s]?"),
+        photos: near("photo[s]?|video[s]?"),
+        edits: near("edit[s]?"),
+        questions: near("question[s]?"),
+        facts: near("fact[s]?"),
+        roadsAdded: near("road[s]? added"),
+        placesAdded: near("place[s]? added"),
+        listsPublished: near("list[s]? published")
+      };
+
+      // If everything is zero, try clicking the "Contributions" tab area (if visible)
+      const allZero = Object.values(counts).every(n => !n);
+      if (allZero) {
+        // sometimes counts render after a tiny delay
+        await page.waitForTimeout(1500);
+        const bodyText2 = await page.textContent("body");
+        if (bodyText2) {
+          const reA = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:points|pts)`, "i");
+          const mm = bodyText2.match(reA);
+          if (mm) counts.points = toNum(mm[1]);
+        }
+      }
+
+      await browser.close();
+      return { url: u, counts };
     } catch (e) {
-      // try next variant
+      lastErr = e;
+      // try next candidate
     }
   }
-  return res.status(422).json({ error: "Failed to fetch any variant" });
+
+  await browser.close();
+  const err = new Error(`Failed to render profile (${String(lastErr)})`);
+  err.code = "RENDER_FAIL";
+  throw err;
+}
+
+app.get("/localguides/summary", async (req, res) => {
+  const src = normalizeIdOrUrl(req.query.contrib_url);
+  if (!src) return res.status(400).json({ error: "Provide ?contrib_url=.../maps/contrib/<id> or the numeric ID" });
+
+  try {
+    const { url, counts } = await getCountsWithBrowser(src);
+    return res.json({
+      contribUrl: url,
+      fetchedAt: new Date().toISOString(),
+      ...counts
+    });
+  } catch (e) {
+    return res.status(422).json({ error: String(e) });
+  }
 });
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
