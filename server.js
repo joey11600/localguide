@@ -18,11 +18,12 @@ const app = express();
 app.use(cors());
 app.use(morgan("tiny"));
 
-/* ----------------------- small utilities ----------------------- */
+/* ----------------------- utilities ----------------------- */
 
 const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) Chrome/124.0 Safari/537.36";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
 
 function normalizeIdOrUrl(raw) {
   const r = String(raw || "").trim();
@@ -32,42 +33,19 @@ function normalizeIdOrUrl(raw) {
   return null;
 }
 
-const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
-
-/** Text parser — mainly for Level & Points, and fallback */
-function pullCountsFrom(text) {
-  const near = (label) => {
-    const A = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
-    const B = new RegExp(`(?:${label})[\\s\\S]{0,120}?(\\d[\\d,\\.]*)`, "i");
-    const m = text.match(A) || text.match(B);
-    return m ? toNum(m[1]) : 0;
-  };
-
+/** ONLY parse Level & Points from visible text (avoid false matches in categories). */
+function pullLevelPoints(text) {
   const levelMatch =
     /Local Guide[^\n]{0,200}?Level\s*(\d+)/i.exec(text) ||
     /Local Guide[^\n]{0,200}?[•·]\s*Level\s*(\d+)/i.exec(text);
   const level = levelMatch ? toNum(levelMatch[1]) : 0;
 
-  const points =
-    near("(?:points|pts)") ||
-    (() => {
-      const m = /(\d[\d,\.]*)\s*(?:point|pts)\b/i.exec(text);
-      return m ? toNum(m[1]) : 0;
-    })();
+  const pointsMatch =
+    /(\d[\d,\.]*)\s+(?:points|pts)\b/i.exec(text) ||
+    /\b(?:points|pts)\b[^\d]{0,40}(\d[\d,\.]*)/i.exec(text);
+  const points = pointsMatch ? toNum(pointsMatch[1]) : 0;
 
-  return {
-    level,
-    points,
-    reviews: near("reviews?"),
-    ratings: near("ratings?"),
-    photos: near("photos?"),
-    edits: near("edits?"),
-    questions: near("answers?"),
-    facts: Math.max(near("reported\\s+incorrect"), near("facts?\\s*checked")),
-    roadsAdded: near("roads?\\s+added"),
-    placesAdded: near("places?\\s+added"),
-    listsPublished: 0
-  };
+  return { level, points };
 }
 
 /* --------------------- Chrome discovery & launch --------------------- */
@@ -116,129 +94,57 @@ async function launchBrowser() {
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--no-first-run",
-      "--no-default-browser-check"
-    ]
+      "--no-default-browser-check",
+    ],
   });
 }
 
-/* --------------- modal open + deep (shadow DOM) extract --------------- */
+/* --------------- open modal + extract rows (exact selectors) --------------- */
 
-/** Click the points chip to open the stats modal. */
 async function openStatsModal(page) {
-  // click the chip by jsaction/class
-  const sel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
-  const exists = await page.$(sel);
-  if (exists) {
-    await page.click(sel).catch(() => {});
+  // Click the chip that opens the modal (selector taken from your DOM)
+  const chipSel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
+  const chip = await page.$(chipSel);
+  if (chip) {
+    await chip.click().catch(() => {});
   } else {
-    // Fallback: click any element with "points" in its text
+    // Fallback: any element showing "points"
     await page.evaluate(() => {
       const nodes = [...document.querySelectorAll('button,[role="button"],a,div,span')];
       const el = nodes.find(n => /points/i.test(n.textContent || ""));
       if (el) el.click();
     });
   }
-  // wait for something that looks like the modal to appear
-  try {
-    await page.waitForFunction(
-      () => !!document.querySelector('.QrGqBf') ||
-            !!document.querySelector('[role="dialog"]') ||
-            !!document.querySelector('div[aria-modal="true"]'),
-      { timeout: 7000 }
-    );
-    return true;
-  } catch {
-    return false;
-  }
+  await page.waitForSelector(".QrGqBf .nKYSz .FM5HI", { timeout: 8000 }); // rows visible
+  return true;
 }
 
-/** Recursively traverse shadow DOM to find rows and extract label/value. */
 async function extractCountsFromModal(page) {
   return await page.evaluate(() => {
     const toNum = v => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
-
-    function* walk(root) {
-      yield root;
-      const els = root.querySelectorAll ? root.querySelectorAll("*") : [];
-      for (const el of els) {
-        yield el;
-        if (el.shadowRoot) {
-          yield* walk(el.shadowRoot);
-        }
-      }
-    }
-
-    // Collect row containers that have either of the class tokens we saw
-    const rows = [];
-    for (const node of walk(document)) {
-      const cls = (node.className || "").toString();
-      if (/\bnKYSz\b/.test(cls)) rows.push(node);
-      // Some builds wrap rows without nKYSz; catch label/value pairs too
-    }
-
-    // Helper: find first match under a root, searching into shadow DOM too
-    function findTextDeep(root, selector) {
-      // direct
-      const direct = root.querySelector?.(selector);
-      if (direct) return (direct.textContent || "").trim();
-      // deep
-      for (const el of root.querySelectorAll?.("*") || []) {
-        if (el.matches?.(selector)) return (el.textContent || "").trim();
-        if (el.shadowRoot) {
-          const t = findTextDeep(el.shadowRoot, selector);
-          if (t) return t;
-        }
-      }
-      return "";
-    }
-
     const out = {
       reviews: 0, ratings: 0, photos: 0, edits: 0, questions: 0, facts: 0,
       roadsAdded: 0, placesAdded: 0, listsPublished: 0
     };
-
-    // Primary: rows with clear label/value spans
+    const rows = Array.from(document.querySelectorAll(".QrGqBf .nKYSz"));
     for (const r of rows) {
-      const label = (findTextDeep(r, ".FM5HI") || "").toLowerCase();
-      const value = toNum(findTextDeep(r, ".AyEQdd") || "0");
+      const label = (r.querySelector(".FM5HI")?.textContent || "").trim().toLowerCase();
+      const value = toNum(r.querySelector(".AyEQdd")?.textContent || "0");
       switch (label) {
         case "reviews": out.reviews = value; break;
         case "ratings": out.ratings = value; break;
         case "photos": out.photos = value; break;
-        case "videos": /* ignore */ break;
-        case "captions": /* ignore */ break;
+        case "videos": break;           // not stored
+        case "captions": break;         // not stored
         case "answers": out.questions = value; break;
         case "edits": out.edits = value; break;
         case "reported incorrect": out.facts = Math.max(out.facts, value); break;
         case "facts checked": out.facts = Math.max(out.facts, value); break;
         case "places added": out.placesAdded = value; break;
         case "roads added": out.roadsAdded = value; break;
-        case "q&a": /* ignore */ break;
+        case "q&a": break;              // not stored
       }
     }
-
-    // Fallback: if we didn’t find rows, scan all text for pairs seen in modal
-    if (
-      !out.reviews && !out.photos && !out.edits && !out.questions &&
-      !out.facts && !out.placesAdded && !out.roadsAdded && !out.ratings
-    ) {
-      const dense = (document.body.innerText || "").replace(/\s+/g, " ");
-      function near(label) {
-        const A = new RegExp(`(\\d[\\d,\\.]*)\\s+(?:${label})`, "i");
-        const B = new RegExp(`(?:${label})\\s*(\\d[\\d,\\.]*)`, "i");
-        const m = dense.match(A) || dense.match(B);
-        return m ? toNum(m[1]) : 0;
-      }
-      out.reviews     = near("Reviews?");
-      out.ratings     = near("Ratings?");
-      out.photos      = near("Photos?");
-      out.edits       = near("Edits?");
-      out.questions   = near("Answers?");
-      out.facts       = Math.max(near("Reported\\s+incorrect"), near("Facts?\\s*checked"));
-      out.placesAdded = near("Places\\s+added");
-      out.roadsAdded  = near("Roads\\s+added");
-    }
-
     return out;
   });
 }
@@ -258,7 +164,7 @@ async function scrapeCounts(contribUrl) {
   // Avoid consent wall
   await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
 
-  // Block heavy assets (allow CSS so layout stays sane)
+  // Block heavy assets (keep CSS)
   if (page.setRequestInterception) {
     await page.setRequestInterception(true);
     page.on("request", (req) => {
@@ -270,7 +176,7 @@ async function scrapeCounts(contribUrl) {
 
   const candidates = [
     `${contribUrl}?hl=en&gl=us&authuser=0`,
-    `${contribUrl}/reviews?hl=en&gl=us&authuser=0`
+    `${contribUrl}/reviews?hl=en&gl=us&authuser=0`,
   ];
 
   let lastErr = null;
@@ -279,42 +185,42 @@ async function scrapeCounts(contribUrl) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
 
-      // open the Local Guide stats modal
-      await openStatsModal(page);
-      // hydrate a bit
+      await openStatsModal(page); // show the numbers modal
+
+      // light hydration nudges
       for (let i = 0; i < 2; i++) {
-        await page.evaluate((y) => window.scrollTo(0, y), 400 * (i + 1));
-        await sleep(600);
+        await page.evaluate((y) => window.scrollTo(0, y), 350 * (i + 1));
+        await sleep(500);
       }
 
-      // DOM-first extraction from modal rows (with deep shadow traversal)
+      // DOM (only) for categories
       const domCounts = await extractCountsFromModal(page);
 
-      // Always parse text for Level/Points (+ safety fallback)
+      // Level/Points from text (safe)
       let bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       if (/Before you continue to Google/i.test(bodyText)) {
         lastErr = "consent wall";
         continue;
       }
-      const textCounts = pullCountsFrom(bodyText);
-
-      // Merge: DOM wins for categories; text provides level/points
-      const merged = {
-        level: textCounts.level,
-        points: textCounts.points,
-        reviews: domCounts.reviews || textCounts.reviews || 0,
-        ratings: domCounts.ratings || textCounts.ratings || 0,
-        photos: domCounts.photos || textCounts.photos || 0,
-        edits: domCounts.edits || textCounts.edits || 0,
-        questions: domCounts.questions || textCounts.questions || 0,
-        facts: domCounts.facts || textCounts.facts || 0,
-        roadsAdded: domCounts.roadsAdded || textCounts.roadsAdded || 0,
-        placesAdded: domCounts.placesAdded || textCounts.placesAdded || 0,
-        listsPublished: domCounts.listsPublished || textCounts.listsPublished || 0
-      };
+      const { level, points } = pullLevelPoints(bodyText);
 
       await browser.close();
-      return { url, counts: merged };
+      return {
+        url,
+        counts: {
+          level,
+          points,
+          reviews: domCounts.reviews ?? 0,
+          ratings: domCounts.ratings ?? 0,
+          photos: domCounts.photos ?? 0,
+          edits: domCounts.edits ?? 0,
+          questions: domCounts.questions ?? 0,
+          facts: domCounts.facts ?? 0,
+          roadsAdded: domCounts.roadsAdded ?? 0,
+          placesAdded: domCounts.placesAdded ?? 0,
+          listsPublished: domCounts.listsPublished ?? 0,
+        },
+      };
     } catch (e) {
       lastErr = String(e);
       // try next candidate
@@ -331,7 +237,7 @@ app.get("/localguides/summary", async (req, res) => {
   const src = normalizeIdOrUrl(req.query.contrib_url);
   if (!src) {
     return res.status(400).json({
-      error: "Provide ?contrib_url=.../maps/contrib/<id> or just the numeric <id>"
+      error: "Provide ?contrib_url=.../maps/contrib/<id> or just the numeric <id>",
     });
   }
   try {
@@ -339,19 +245,60 @@ app.get("/localguides/summary", async (req, res) => {
     return res.json({
       contribUrl: url,
       fetchedAt: new Date().toISOString(),
-      ...counts
+      ...counts,
     });
   } catch (e) {
     return res.status(422).json({ error: String(e) });
   }
 });
 
-// Debug helpers
+// Row-level diagnostics — shows exactly what we read from the modal
+app.get("/localguides/diag-rows", async (req, res) => {
+  try {
+    const src = normalizeIdOrUrl(req.query.contrib_url);
+    if (!src) return res.status(400).json({ error: "Missing ?contrib_url" });
+
+    const browser = await launchBrowser();
+    const ctx = await browser.createBrowserContext();
+    const page = await ctx.newPage();
+
+    await page.setUserAgent(UA);
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+    await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
+    await page.goto(`${src}?hl=en&gl=us&authuser=0`, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await openStatsModal(page);
+
+    const rows = await page.evaluate(() => {
+      const toNum = v => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
+      return Array.from(document.querySelectorAll(".QrGqBf .nKYSz")).map(r => ({
+        label: (r.querySelector(".FM5HI")?.textContent || "").trim(),
+        value: toNum(r.querySelector(".AyEQdd")?.textContent || "0"),
+      }));
+    });
+
+    const text = (await page.evaluate(() => document.body.innerText)) || "";
+    const lp = (() => {
+      const m1 = /Local Guide[^\n]{0,200}?Level\s*(\d+)/i.exec(text) ||
+                 /Local Guide[^\n]{0,200}?[•·]\s*Level\s*(\d+)/i.exec(text);
+      const level = m1 ? Number(String(m1[1])) : 0;
+      const m2 = /(\d[\d,\.]*)\s+(?:points|pts)\b/i.exec(text);
+      const points = m2 ? Number(String(m2[1]).replace(/[^\d]/g, "")) : 0;
+      return { level, points };
+    })();
+
+    await browser.close();
+    res.json({ rows, levelPoints: lp });
+  } catch (e) {
+    res.status(422).json({ error: String(e) });
+  }
+});
+
+// Generic debug helpers
 app.get("/__whoami", (_req, res) => {
   res.json({
     node: process.version,
     execPathTried: findChromeBinary(),
-    cacheDirExists: fs.existsSync("/opt/render/project/src/.puppeteer-cache")
+    cacheDirExists: fs.existsSync("/opt/render/project/src/.puppeteer-cache"),
   });
 });
 
@@ -366,28 +313,6 @@ app.get("/__ls", (_req, res) => {
     res.type("text/plain").send(out);
   } catch (e) {
     res.status(500).type("text/plain").send(String(e));
-  }
-});
-
-app.get("/localguides/debug", async (req, res) => {
-  try {
-    const src = normalizeIdOrUrl(req.query.contrib_url);
-    if (!src) return res.status(400).json({ error: "Missing ?contrib_url" });
-    const browser = await launchBrowser();
-    const ctx = await browser.createBrowserContext();
-    const page = await ctx.newPage();
-    await page.setUserAgent(UA);
-    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-    await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
-    const url = `${src}?hl=en&gl=us&authuser=0`;
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
-    await openStatsModal(page);
-    await sleep(800);
-    const text = (await page.evaluate(() => document.body.innerText)) || "";
-    await browser.close();
-    res.json({ url, sample: text.slice(0, 2000) });
-  } catch (e) {
-    res.status(422).json({ error: String(e) });
   }
 });
 
