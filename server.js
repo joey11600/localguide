@@ -102,21 +102,40 @@ async function launchBrowser() {
 /* --------------- open modal + extract rows (exact selectors) --------------- */
 
 async function openStatsModal(page) {
-  // Click the chip that opens the modal (selector taken from your DOM)
   const chipSel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
-  const chip = await page.$(chipSel);
-  if (chip) {
-    await chip.click().catch(() => {});
-  } else {
-    // Fallback: any element showing "points"
-    await page.evaluate(() => {
-      const nodes = [...document.querySelectorAll('button,[role="button"],a,div,span')];
-      const el = nodes.find(n => /points/i.test(n.textContent || ""));
-      if (el) el.click();
-    });
+  try {
+    // Wait for the points chip to exist (Google sometimes lazy-renders)
+    await page.waitForSelector(chipSel, { timeout: 15000 });
+    const chip = await page.$(chipSel);
+    if (chip) {
+      await chip.click().catch(() => {});
+      await page.waitForTimeout(2000); // allow popup to animate
+    } else {
+      // Fallback: try clicking any visible element containing "points"
+      await page.evaluate(() => {
+        const nodes = [...document.querySelectorAll('button,[role="button"],a,div,span')];
+        const el = nodes.find(n => /points/i.test(n.textContent || ""));
+        if (el) el.click();
+      });
+      await page.waitForTimeout(2000);
+    }
+
+    // Wait for the stats container to appear
+    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 20000 });
+    return true;
+  } catch (err) {
+    console.warn("Stats modal not found on first try:", err);
+    // Retry once after reload — handles slow renders or animation delays
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(4000);
+    const chip = await page.$(chipSel);
+    if (chip) {
+      await chip.click().catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 20000 });
+    return true;
   }
-  await page.waitForSelector(".QrGqBf .nKYSz .FM5HI", { timeout: 8000 }); // rows visible
-  return true;
 }
 
 async function extractCountsFromModal(page) {
