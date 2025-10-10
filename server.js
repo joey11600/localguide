@@ -20,7 +20,6 @@ app.use(morgan("tiny"));
 
 /* ----------------------- utilities ----------------------- */
 
-// Valid UA
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -49,7 +48,6 @@ function pullLevelPoints(text) {
   return { level, points };
 }
 
-// Hard deadline guard
 async function withDeadline(promise, ms, label = "operation") {
   let t;
   const gate = new Promise((_, rej) => {
@@ -142,18 +140,42 @@ function setCache(k, data, ms = 5 * 60 * 1000) {
   cache.set(k, { data, exp: Date.now() + ms });
 }
 
+/* ------------- concurrency limiter + deduped in-flight -------------- */
+
+class Limiter {
+  constructor(max = 2) { this.max = max; this.active = 0; this.waiters = []; }
+  async run(task) {
+    if (this.active >= this.max) await new Promise(res => this.waiters.push(res));
+    this.active++;
+    try { return await task(); }
+    finally {
+      this.active--;
+      const next = this.waiters.shift();
+      if (next) next();
+    }
+  }
+}
+const scrapeLimiter = new Limiter(Number(process.env.SCRAPE_CONCURRENCY || 2));
+const inflight = new Map(); // key -> Promise
+async function deduped(key, fn) {
+  if (inflight.has(key)) return inflight.get(key);
+  const p = (async () => {
+    try { return await fn(); }
+    finally { inflight.delete(key); }
+  })();
+  inflight.set(key, p);
+  return p;
+}
+
 /* ---------- selectors & helpers: modal open, name, counts ---------- */
 
 async function openStatsModal(page) {
   const chipSel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
-  // Quick attempt to click the points chip (short waits)
   try {
     await page.waitForSelector(chipSel, { timeout: 6000 });
     const chip = await page.$(chipSel);
     if (chip) { await chip.click().catch(() => {}); await sleep(800); }
   } catch {}
-
-  // Wait for stats rows; if not found, nudge & wait again (no full reload)
   try {
     await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 8000 });
     return true;
@@ -180,15 +202,12 @@ async function extractCountsFromModal(page) {
         case "reviews": out.reviews = value; break;
         case "ratings": out.ratings = value; break;
         case "photos": out.photos = value; break;
-        case "videos": break;
-        case "captions": break;
         case "answers": out.questions = value; break;
         case "edits": out.edits = value; break;
-        case "reported incorrect": out.facts = Math.max(out.facts, value); break;
+        case "reported incorrect":
         case "facts checked": out.facts = Math.max(out.facts, value); break;
         case "places added": out.placesAdded = value; break;
         case "roads added": out.roadsAdded = value; break;
-        case "q&a": break;
       }
     }
     return out;
@@ -196,16 +215,16 @@ async function extractCountsFromModal(page) {
 }
 
 async function extractContributorName(page) {
-  const trySelectors = [
+  const sels = [
     'h1.geAzIe.fontHeadlineLarge',
     'h1[role="button"][aria-haspopup="true"]',
     '.fontHeadlineLarge',
     'header h1',
   ];
-  for (const sel of trySelectors) {
+  for (const s of sels) {
     try {
-      const s = await page.$eval(sel, el => (el.textContent || "").trim());
-      if (s) return s;
+      const name = await page.$eval(s, el => (el.textContent || "").trim());
+      if (name) return name;
     } catch {}
   }
   try {
@@ -213,8 +232,7 @@ async function extractContributorName(page) {
       const text = document.body.innerText || "";
       const lines = text.split("\n").slice(0, 50).map(s => s.trim()).filter(Boolean);
       const re = /^[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+){1,2}$/;
-      const cand = lines.find(l => re.test(l) && !/Google Maps|My Contributions|Local Guide/i.test(l));
-      return cand || null;
+      return lines.find(l => re.test(l) && !/Google Maps|Local Guide/i.test(l)) || null;
     });
     if (guess) return guess;
   } catch {}
@@ -229,25 +247,20 @@ async function scrapeCounts(contribUrl) {
   const page = await ctx.newPage();
 
   await page.setUserAgent(UA);
-  await page.setViewport?.({ width: 1366, height: 900, deviceScaleFactor: 1 });
+  await page.setViewport?.({ width: 1366, height: 900 });
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
   page.setDefaultNavigationTimeout?.(25_000);
   page.setDefaultTimeout?.(15_000);
 
-  // Avoid consent wall
   await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
 
-  // Block heavy assets (keep CSS)
-  if (page.setRequestInterception) {
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      const t = req.resourceType();
-      if (t === "image" || t === "media" || t === "font") return req.abort();
-      req.continue();
-    });
-  }
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    const t = req.resourceType();
+    if (t === "image" || t === "media" || t === "font") return req.abort();
+    req.continue();
+  });
 
-  // Prefer the base contrib URL; fallback to /reviews only if needed
   const candidates = [
     `${contribUrl}?hl=en&gl=us&authuser=0`,
     `${contribUrl}/reviews?hl=en&gl=us&authuser=0`,
@@ -255,76 +268,43 @@ async function scrapeCounts(contribUrl) {
 
   let lastErr = null;
 
-  for (let idx = 0; idx < candidates.length; idx++) {
-    const url = candidates[idx];
+  for (let i = 0; i < candidates.length; i++) {
+    const url = candidates[i];
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
-
-      // quick consent check
       const preTxt = (await page.evaluate(() => document.body.innerText)) || "";
-      if (/Before you continue to Google/i.test(preTxt)) {
-        throw new Error("consent wall");
-      }
+      if (/Before you continue to Google/i.test(preTxt)) throw new Error("consent wall");
 
-      // Try to get the name early
       let nameEarly = await extractContributorName(page).catch(() => null);
-
-      // show the numbers modal (short waits)
       await openStatsModal(page);
 
-      // light hydration nudges
-      for (let i = 0; i < 2; i++) {
-        await page.evaluate((y) => window.scrollTo(0, y), 350 * (i + 1));
+      for (let j = 0; j < 2; j++) {
+        await page.evaluate((y) => window.scrollTo(0, y), 350 * (j + 1));
         await sleep(300);
       }
 
-      // DOM (only) for categories
       const domCounts = await extractCountsFromModal(page);
-
-      // Level/Points from text (safe)
       const bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       const { level, points } = pullLevelPoints(bodyText);
+      let name = nameEarly || await extractContributorName(page).catch(() => null);
 
-      // Finalize name (prefer early, else try again)
-      let name = nameEarly;
-      if (!name) { try { name = await extractContributorName(page); } catch {} }
-
-      await ctx.close(); // close context, keep browser warm
-      scheduleIdleClose(60_000);
-
+      await ctx.close();
+      scheduleIdleClose();
       return {
         url,
-        counts: {
-          name: name || null,
-          level,
-          points,
-          reviews: domCounts.reviews ?? 0,
-          ratings: domCounts.ratings ?? 0,
-          photos: domCounts.photos ?? 0,
-          edits: domCounts.edits ?? 0,
-          questions: domCounts.questions ?? 0,
-          facts: domCounts.facts ?? 0,
-          roadsAdded: domCounts.roadsAdded ?? 0,
-          placesAdded: domCounts.placesAdded ?? 0,
-          listsPublished: domCounts.listsPublished ?? 0,
-        },
+        counts: { name, level, points, ...domCounts },
       };
     } catch (e) {
       const msg = String(e || "");
       lastErr = msg;
-
-      // Stop early for consent wall (no point trying alt URL)
       if (/consent wall/i.test(msg)) break;
-
-      // Only try the second candidate if the first failed due to selector/timeout
-      const isSelectorTimeout = /timeout/i.test(msg) || /Waiting for selector/i.test(msg);
-      if (!(isSelectorTimeout && idx === 0)) break;
-      // else loop continues to try /reviews once
+      const isTimeout = /timeout/i.test(msg) || /Waiting for selector/i.test(msg);
+      if (!(isTimeout && i === 0)) break;
     }
   }
 
   await ctx.close().catch(() => {});
-  scheduleIdleClose(60_000);
+  scheduleIdleClose();
   throw new Error(`Failed to parse profile (${lastErr || "unknown"})`);
 }
 
@@ -332,97 +312,29 @@ async function scrapeCounts(contribUrl) {
 
 app.get("/localguides/summary", async (req, res) => {
   const src = normalizeIdOrUrl(req.query.contrib_url);
-  if (!src) {
-    return res.status(400).json({
-      error: "Provide ?contrib_url=.../maps/contrib/<id> or just the numeric <id>",
-    });
-  }
+  if (!src)
+    return res.status(400).json({ error: "Provide ?contrib_url=.../maps/contrib/<id>" });
 
-  // cache layer
   const key = `sum:${src}`;
   const cached = getCache(key);
   if (cached) return res.json(cached);
 
   try {
-    const { url, counts } = await withDeadline(scrapeCounts(src), 45_000, "scrapeCounts");
-    const payload = {
-      contribUrl: url,
-      fetchedAt: new Date().toISOString(),
-      ...counts,
-    };
+    const { url, counts } = await withDeadline(
+      deduped(key, () => scrapeLimiter.run(() => scrapeCounts(src))),
+      45_000,
+      "scrapeCounts"
+    );
+    const payload = { contribUrl: url, fetchedAt: new Date().toISOString(), ...counts };
     setCache(key, payload);
     return res.json(payload);
   } catch (e) {
-    // Optional: capture a screenshot for diagnostics (best-effort)
-    try {
-      const browser = await getBrowser();
-      const ctx = await browser.createBrowserContext();
-      const page = await ctx.newPage();
-      await page.goto(src, { waitUntil: "domcontentloaded", timeout: 15_000 }).catch(() => {});
-      await page.screenshot({ path: "/tmp/lg_last_error.png", fullPage: true }).catch(() => {});
-      await ctx.close().catch(() => {});
-      scheduleIdleClose(60_000);
-    } catch {}
     return res.status(422).json({ error: String(e) });
   }
 });
 
-// Row-level diagnostics — shows exactly what we read from the modal
-app.get("/localguides/diag-rows", async (req, res) => {
-  try {
-    const src = normalizeIdOrUrl(req.query.contrib_url);
-    if (!src) return res.status(400).json({ error: "Missing ?contrib_url" });
+/* ------------------------------ misc ------------------------------ */
 
-    const browser = await getBrowser();
-    const ctx = await browser.createBrowserContext();
-    const page = await ctx.newPage();
-
-    await page.setUserAgent(UA);
-    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-    await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
-    await page.goto(`${src}?hl=en&gl=us&authuser=0`, { waitUntil: "domcontentloaded", timeout: 20_000 });
-
-    const name = await extractContributorName(page).catch(() => null);
-    await openStatsModal(page);
-
-    const rows = await page.evaluate(() => {
-      const toNum = v => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
-      return Array.from(document.querySelectorAll(".QrGqBf .nKYSz")).map(r => ({
-        label: (r.querySelector(".FM5HI")?.textContent || "").trim(),
-        value: toNum(r.querySelector(".AyEQdd")?.textContent || "0"),
-      }));
-    });
-
-    const text = (await page.evaluate(() => document.body.innerText)) || "";
-    const lp = (() => {
-      const m1 = /Local Guide[^\n]{0,200}?Level\s*(\d+)/i.exec(text) ||
-                 /Local Guide[^\n]{0,200}?[•·]\s*Level\s*(\d+)/i.exec(text);
-      const level = m1 ? Number(String(m1[1])) : 0;
-      const m2 = /(\d[\d,\.]*)\s+(?:points|pts)\b/i.exec(text);
-      const points = m2 ? Number(String(m2[1]).replace(/[^\d]/g, "")) : 0;
-      return { level, points };
-    })();
-
-    const headerHTML = await page.evaluate(() => {
-      const el = document.querySelector('h1.geAzIe.fontHeadlineLarge') || document.querySelector('h1, .fontHeadlineLarge');
-      return el ? el.outerHTML : null;
-    });
-
-    await ctx.close();
-    scheduleIdleClose(60_000);
-    res.json({ name, rows, levelPoints: lp, headerHTML });
-  } catch (e) {
-    res.status(422).json({ error: String(e) });
-  }
-});
-
-// alias for convenience (if you wired /localguides/debug on the app side)
-app.get("/localguides/debug", async (req, res) => {
-  req.url = req.url.replace("/localguides/debug", "/localguides/diag-rows");
-  app._router.handle(req, res);
-});
-
-// Generic debug helpers
 app.get("/__whoami", (_req, res) => {
   res.json({
     node: process.version,
@@ -441,14 +353,9 @@ app.get("/__ls", (_req, res) => {
       .toString();
     res.type("text/plain").send(out);
   } catch (e) {
-    res.status(500).type("text/plain").send(String(e) });
-});
-
-// serve the last error screenshot if present
-app.get("/__lastshot", (_req, res) => {
-  const p = "/tmp/lg_last_error.png";
-  if (fs.existsSync(p)) return res.sendFile(p);
-  res.status(404).send("No screenshot");
+    // ✅ fixed: close the parenthesis
+    res.status(500).type("text/plain").send(String(e));
+  }
 });
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
