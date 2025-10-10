@@ -111,7 +111,7 @@ async function openStatsModal(page) {
     const chip = await page.$(chipSel);
     if (chip) {
       await chip.click().catch(() => {});
-      await page.waitForTimeout(2000); // allow popup to animate
+      await sleep(2000); // allow popup to animate
     } else {
       // Fallback: try clicking any visible element containing "points"
       await page.evaluate(() => {
@@ -119,7 +119,7 @@ async function openStatsModal(page) {
         const el = nodes.find(n => /points/i.test(n.textContent || ""));
         if (el) el.click();
       });
-      await page.waitForTimeout(2000);
+      await sleep(2000);
     }
 
     // Wait for the stats container to appear
@@ -129,11 +129,11 @@ async function openStatsModal(page) {
     console.warn("Stats modal not found on first try:", err);
     // Retry once after reload — handles slow renders or animation delays
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(4000);
+    await sleep(4000);
     const chip = await page.$(chipSel);
     if (chip) {
       await chip.click().catch(() => {});
-      await page.waitForTimeout(2000);
+      await sleep(2000);
     }
     await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 20000 });
     return true;
