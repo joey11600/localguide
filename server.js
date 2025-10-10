@@ -20,8 +20,10 @@ app.use(morgan("tiny"));
 
 /* ----------------------- utilities ----------------------- */
 
+// ✅ fix UA (your previous UA had AppleWebKit(537.36) typo)
 const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) Chrome/124.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
 
@@ -99,7 +101,7 @@ async function launchBrowser() {
   });
 }
 
-/* --------------- open modal + extract rows (exact selectors) --------------- */
+/* ---------- selectors & helpers: modal open, name, counts ---------- */
 
 async function openStatsModal(page) {
   const chipSel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
@@ -168,6 +170,35 @@ async function extractCountsFromModal(page) {
   });
 }
 
+async function extractContributorName(page) {
+  // Try explicit header first
+  const trySelectors = [
+    'h1.geAzIe.fontHeadlineLarge',
+    'h1[role="button"][aria-haspopup="true"]',
+    '.fontHeadlineLarge',
+    'header h1',
+  ];
+  for (const sel of trySelectors) {
+    try {
+      const s = await page.$eval(sel, el => (el.textContent || "").trim());
+      if (s) return s;
+    } catch {}
+  }
+  // Fallback: scan a few obvious containers for a likely name (two words, letters only)
+  try {
+    const guess = await page.evaluate(() => {
+      const text = document.body.innerText || "";
+      // look for a "Firstname Lastname" style near top of page text
+      const lines = text.split("\n").slice(0, 50).map(s => s.trim()).filter(Boolean);
+      const re = /^[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+){1,2}$/;
+      const cand = lines.find(l => re.test(l) && !/Google Maps|My Contributions|Local Guide/i.test(l));
+      return cand || null;
+    });
+    if (guess) return guess;
+  } catch {}
+  return null;
+}
+
 /* --------------------------- core scraper --------------------------- */
 
 async function scrapeCounts(contribUrl) {
@@ -176,6 +207,7 @@ async function scrapeCounts(contribUrl) {
   const page = await ctx.newPage();
 
   await page.setUserAgent(UA);
+  await page.setViewport?.({ width: 1366, height: 900, deviceScaleFactor: 1 });
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
   page.setDefaultNavigationTimeout?.(90_000);
   page.setDefaultTimeout?.(45_000);
@@ -204,6 +236,9 @@ async function scrapeCounts(contribUrl) {
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
 
+      // Try to get the name as soon as the page text is there
+      let nameEarly = await extractContributorName(page).catch(() => null);
+
       await openStatsModal(page); // show the numbers modal
 
       // light hydration nudges
@@ -223,10 +258,17 @@ async function scrapeCounts(contribUrl) {
       }
       const { level, points } = pullLevelPoints(bodyText);
 
+      // Finalize name (prefer early, else try again)
+      let name = nameEarly;
+      if (!name) {
+        try { name = await extractContributorName(page); } catch {}
+      }
+
       await browser.close();
       return {
         url,
         counts: {
+          name: name || null,
           level,
           points,
           reviews: domCounts.reviews ?? 0,
@@ -267,6 +309,15 @@ app.get("/localguides/summary", async (req, res) => {
       ...counts,
     });
   } catch (e) {
+    // (Optional) capture a screenshot on failure for diagnostics
+    try {
+      const browser = await launchBrowser();
+      const ctx = await browser.createBrowserContext();
+      const page = await ctx.newPage();
+      await page.goto(src, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.screenshot({ path: "/tmp/lg_last_error.png", fullPage: true });
+      await browser.close();
+    } catch {}
     return res.status(422).json({ error: String(e) });
   }
 });
@@ -285,6 +336,8 @@ app.get("/localguides/diag-rows", async (req, res) => {
     await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
     await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
     await page.goto(`${src}?hl=en&gl=us&authuser=0`, { waitUntil: "domcontentloaded", timeout: 90_000 });
+
+    const name = await extractContributorName(page).catch(() => null);
     await openStatsModal(page);
 
     const rows = await page.evaluate(() => {
@@ -305,11 +358,22 @@ app.get("/localguides/diag-rows", async (req, res) => {
       return { level, points };
     })();
 
+    const headerHTML = await page.evaluate(() => {
+      const el = document.querySelector('h1.geAzIe.fontHeadlineLarge') || document.querySelector('h1, .fontHeadlineLarge');
+      return el ? el.outerHTML : null;
+    });
+
     await browser.close();
-    res.json({ rows, levelPoints: lp });
+    res.json({ name, rows, levelPoints: lp, headerHTML });
   } catch (e) {
     res.status(422).json({ error: String(e) });
   }
+});
+
+// alias for convenience (if you wired /localguides/debug on the app side)
+app.get("/localguides/debug", async (req, res) => {
+  req.url = req.url.replace("/localguides/debug", "/localguides/diag-rows");
+  app._router.handle(req, res);
 });
 
 // Generic debug helpers
@@ -333,6 +397,13 @@ app.get("/__ls", (_req, res) => {
   } catch (e) {
     res.status(500).type("text/plain").send(String(e));
   }
+});
+
+// serve the last error screenshot if present
+app.get("/__lastshot", (_req, res) => {
+  const p = "/tmp/lg_last_error.png";
+  if (fs.existsSync(p)) return res.sendFile(p);
+  res.status(404).send("No screenshot");
 });
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
