@@ -20,7 +20,7 @@ app.use(morgan("tiny"));
 
 /* ----------------------- utilities ----------------------- */
 
-// ✅ fix UA (your previous UA had AppleWebKit(537.36) typo)
+// Valid UA
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -35,7 +35,6 @@ function normalizeIdOrUrl(raw) {
   return null;
 }
 
-/** ONLY parse Level & Points from visible text (avoid false matches in categories). */
 function pullLevelPoints(text) {
   const levelMatch =
     /Local Guide[^\n]{0,200}?Level\s*(\d+)/i.exec(text) ||
@@ -48,6 +47,16 @@ function pullLevelPoints(text) {
   const points = pointsMatch ? toNum(pointsMatch[1]) : 0;
 
   return { level, points };
+}
+
+// Hard deadline guard
+async function withDeadline(promise, ms, label = "operation") {
+  let t;
+  const gate = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try { return await Promise.race([promise, gate]); }
+  finally { clearTimeout(t); }
 }
 
 /* --------------------- Chrome discovery & launch --------------------- */
@@ -101,41 +110,57 @@ async function launchBrowser() {
   });
 }
 
+/* --------- browser singleton (kept warm) + idle shutdown ---------- */
+
+let _browser = null;
+let _idleTimer = null;
+
+async function getBrowser() {
+  if (_browser) return _browser;
+  _browser = await launchBrowser();
+  return _browser;
+}
+function scheduleIdleClose(ms = 60_000) {
+  if (_idleTimer) clearTimeout(_idleTimer);
+  _idleTimer = setTimeout(async () => {
+    try { await _browser?.close(); } catch {}
+    _browser = null;
+    _idleTimer = null;
+  }, ms);
+}
+
+/* ---------------- small in-memory cache (5 min TTL) ---------------- */
+
+const cache = new Map(); // key -> {data, exp}
+function getCache(k) {
+  const v = cache.get(k);
+  if (!v) return null;
+  if (Date.now() > v.exp) { cache.delete(k); return null; }
+  return v.data;
+}
+function setCache(k, data, ms = 5 * 60 * 1000) {
+  cache.set(k, { data, exp: Date.now() + ms });
+}
+
 /* ---------- selectors & helpers: modal open, name, counts ---------- */
 
 async function openStatsModal(page) {
   const chipSel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
+  // Quick attempt to click the points chip (short waits)
   try {
-    // Wait for the points chip to exist (Google sometimes lazy-renders)
-    await page.waitForSelector(chipSel, { timeout: 15000 });
+    await page.waitForSelector(chipSel, { timeout: 6000 });
     const chip = await page.$(chipSel);
-    if (chip) {
-      await chip.click().catch(() => {});
-      await sleep(2000); // allow popup to animate
-    } else {
-      // Fallback: try clicking any visible element containing "points"
-      await page.evaluate(() => {
-        const nodes = [...document.querySelectorAll('button,[role="button"],a,div,span')];
-        const el = nodes.find(n => /points/i.test(n.textContent || ""));
-        if (el) el.click();
-      });
-      await sleep(2000);
-    }
+    if (chip) { await chip.click().catch(() => {}); await sleep(800); }
+  } catch {}
 
-    // Wait for the stats container to appear
-    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 20000 });
+  // Wait for stats rows; if not found, nudge & wait again (no full reload)
+  try {
+    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 8000 });
     return true;
-  } catch (err) {
-    console.warn("Stats modal not found on first try:", err);
-    // Retry once after reload — handles slow renders or animation delays
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await sleep(4000);
-    const chip = await page.$(chipSel);
-    if (chip) {
-      await chip.click().catch(() => {});
-      await sleep(2000);
-    }
-    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 20000 });
+  } catch {
+    await page.evaluate(() => window.scrollTo(0, 300));
+    await sleep(700);
+    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 6000 });
     return true;
   }
 }
@@ -155,15 +180,15 @@ async function extractCountsFromModal(page) {
         case "reviews": out.reviews = value; break;
         case "ratings": out.ratings = value; break;
         case "photos": out.photos = value; break;
-        case "videos": break;           // not stored
-        case "captions": break;         // not stored
+        case "videos": break;
+        case "captions": break;
         case "answers": out.questions = value; break;
         case "edits": out.edits = value; break;
         case "reported incorrect": out.facts = Math.max(out.facts, value); break;
         case "facts checked": out.facts = Math.max(out.facts, value); break;
         case "places added": out.placesAdded = value; break;
         case "roads added": out.roadsAdded = value; break;
-        case "q&a": break;              // not stored
+        case "q&a": break;
       }
     }
     return out;
@@ -171,7 +196,6 @@ async function extractCountsFromModal(page) {
 }
 
 async function extractContributorName(page) {
-  // Try explicit header first
   const trySelectors = [
     'h1.geAzIe.fontHeadlineLarge',
     'h1[role="button"][aria-haspopup="true"]',
@@ -184,11 +208,9 @@ async function extractContributorName(page) {
       if (s) return s;
     } catch {}
   }
-  // Fallback: scan a few obvious containers for a likely name (two words, letters only)
   try {
     const guess = await page.evaluate(() => {
       const text = document.body.innerText || "";
-      // look for a "Firstname Lastname" style near top of page text
       const lines = text.split("\n").slice(0, 50).map(s => s.trim()).filter(Boolean);
       const re = /^[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+){1,2}$/;
       const cand = lines.find(l => re.test(l) && !/Google Maps|My Contributions|Local Guide/i.test(l));
@@ -202,15 +224,15 @@ async function extractContributorName(page) {
 /* --------------------------- core scraper --------------------------- */
 
 async function scrapeCounts(contribUrl) {
-  const browser = await launchBrowser();
+  const browser = await getBrowser();
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
 
   await page.setUserAgent(UA);
   await page.setViewport?.({ width: 1366, height: 900, deviceScaleFactor: 1 });
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-  page.setDefaultNavigationTimeout?.(90_000);
-  page.setDefaultTimeout?.(45_000);
+  page.setDefaultNavigationTimeout?.(25_000);
+  page.setDefaultTimeout?.(15_000);
 
   // Avoid consent wall
   await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
@@ -225,6 +247,7 @@ async function scrapeCounts(contribUrl) {
     });
   }
 
+  // Prefer the base contrib URL; fallback to /reviews only if needed
   const candidates = [
     `${contribUrl}?hl=en&gl=us&authuser=0`,
     `${contribUrl}/reviews?hl=en&gl=us&authuser=0`,
@@ -232,39 +255,43 @@ async function scrapeCounts(contribUrl) {
 
   let lastErr = null;
 
-  for (const url of candidates) {
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const url = candidates[idx];
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
 
-      // Try to get the name as soon as the page text is there
+      // quick consent check
+      const preTxt = (await page.evaluate(() => document.body.innerText)) || "";
+      if (/Before you continue to Google/i.test(preTxt)) {
+        throw new Error("consent wall");
+      }
+
+      // Try to get the name early
       let nameEarly = await extractContributorName(page).catch(() => null);
 
-      await openStatsModal(page); // show the numbers modal
+      // show the numbers modal (short waits)
+      await openStatsModal(page);
 
       // light hydration nudges
       for (let i = 0; i < 2; i++) {
         await page.evaluate((y) => window.scrollTo(0, y), 350 * (i + 1));
-        await sleep(500);
+        await sleep(300);
       }
 
       // DOM (only) for categories
       const domCounts = await extractCountsFromModal(page);
 
       // Level/Points from text (safe)
-      let bodyText = (await page.evaluate(() => document.body.innerText)) || "";
-      if (/Before you continue to Google/i.test(bodyText)) {
-        lastErr = "consent wall";
-        continue;
-      }
+      const bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       const { level, points } = pullLevelPoints(bodyText);
 
       // Finalize name (prefer early, else try again)
       let name = nameEarly;
-      if (!name) {
-        try { name = await extractContributorName(page); } catch {}
-      }
+      if (!name) { try { name = await extractContributorName(page); } catch {} }
 
-      await browser.close();
+      await ctx.close(); // close context, keep browser warm
+      scheduleIdleClose(60_000);
+
       return {
         url,
         counts: {
@@ -283,12 +310,21 @@ async function scrapeCounts(contribUrl) {
         },
       };
     } catch (e) {
-      lastErr = String(e);
-      // try next candidate
+      const msg = String(e || "");
+      lastErr = msg;
+
+      // Stop early for consent wall (no point trying alt URL)
+      if (/consent wall/i.test(msg)) break;
+
+      // Only try the second candidate if the first failed due to selector/timeout
+      const isSelectorTimeout = /timeout/i.test(msg) || /Waiting for selector/i.test(msg);
+      if (!(isSelectorTimeout && idx === 0)) break;
+      // else loop continues to try /reviews once
     }
   }
 
-  await browser.close();
+  await ctx.close().catch(() => {});
+  scheduleIdleClose(60_000);
   throw new Error(`Failed to parse profile (${lastErr || "unknown"})`);
 }
 
@@ -301,22 +337,31 @@ app.get("/localguides/summary", async (req, res) => {
       error: "Provide ?contrib_url=.../maps/contrib/<id> or just the numeric <id>",
     });
   }
+
+  // cache layer
+  const key = `sum:${src}`;
+  const cached = getCache(key);
+  if (cached) return res.json(cached);
+
   try {
-    const { url, counts } = await scrapeCounts(src);
-    return res.json({
+    const { url, counts } = await withDeadline(scrapeCounts(src), 45_000, "scrapeCounts");
+    const payload = {
       contribUrl: url,
       fetchedAt: new Date().toISOString(),
       ...counts,
-    });
+    };
+    setCache(key, payload);
+    return res.json(payload);
   } catch (e) {
-    // (Optional) capture a screenshot on failure for diagnostics
+    // Optional: capture a screenshot for diagnostics (best-effort)
     try {
-      const browser = await launchBrowser();
+      const browser = await getBrowser();
       const ctx = await browser.createBrowserContext();
       const page = await ctx.newPage();
-      await page.goto(src, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      await page.screenshot({ path: "/tmp/lg_last_error.png", fullPage: true });
-      await browser.close();
+      await page.goto(src, { waitUntil: "domcontentloaded", timeout: 15_000 }).catch(() => {});
+      await page.screenshot({ path: "/tmp/lg_last_error.png", fullPage: true }).catch(() => {});
+      await ctx.close().catch(() => {});
+      scheduleIdleClose(60_000);
     } catch {}
     return res.status(422).json({ error: String(e) });
   }
@@ -328,14 +373,14 @@ app.get("/localguides/diag-rows", async (req, res) => {
     const src = normalizeIdOrUrl(req.query.contrib_url);
     if (!src) return res.status(400).json({ error: "Missing ?contrib_url" });
 
-    const browser = await launchBrowser();
+    const browser = await getBrowser();
     const ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
 
     await page.setUserAgent(UA);
     await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
     await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
-    await page.goto(`${src}?hl=en&gl=us&authuser=0`, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await page.goto(`${src}?hl=en&gl=us&authuser=0`, { waitUntil: "domcontentloaded", timeout: 20_000 });
 
     const name = await extractContributorName(page).catch(() => null);
     await openStatsModal(page);
@@ -363,7 +408,8 @@ app.get("/localguides/diag-rows", async (req, res) => {
       return el ? el.outerHTML : null;
     });
 
-    await browser.close();
+    await ctx.close();
+    scheduleIdleClose(60_000);
     res.json({ name, rows, levelPoints: lp, headerHTML });
   } catch (e) {
     res.status(422).json({ error: String(e) });
@@ -395,8 +441,7 @@ app.get("/__ls", (_req, res) => {
       .toString();
     res.type("text/plain").send(out);
   } catch (e) {
-    res.status(500).type("text/plain").send(String(e));
-  }
+    res.status(500).type("text/plain").send(String(e) });
 });
 
 // serve the last error screenshot if present
