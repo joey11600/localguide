@@ -129,7 +129,7 @@ function scheduleIdleClose(ms = 60_000) {
 
 /* ---------------- small in-memory cache (5 min TTL) ---------------- */
 
-const cache = new Map(); // key -> {data, exp}
+const cache = new Map();
 function getCache(k) {
   const v = cache.get(k);
   if (!v) return null;
@@ -155,8 +155,8 @@ class Limiter {
     }
   }
 }
-const scrapeLimiter = new Limiter(Number(process.env.SCRAPE_CONCURRENCY || 2));
-const inflight = new Map(); // key -> Promise
+const scrapeLimiter = new Limiter(Number(process.env.SCRAPE_CONCURRENCY || 1));
+const inflight = new Map();
 async function deduped(key, fn) {
   if (inflight.has(key)) return inflight.get(key);
   const p = (async () => {
@@ -169,20 +169,20 @@ async function deduped(key, fn) {
 
 /* ---------- selectors & helpers: modal open, name, counts ---------- */
 
-async function openStatsModal(page) {
+async function openStatsModal(page, slow = false) {
   const chipSel = '[jsaction*="pane.profile-stats.showStats"], .uyVA9';
   try {
-    await page.waitForSelector(chipSel, { timeout: 6000 });
+    await page.waitForSelector(chipSel, { timeout: slow ? 12000 : 6000 });
     const chip = await page.$(chipSel);
-    if (chip) { await chip.click().catch(() => {}); await sleep(800); }
+    if (chip) { await chip.click().catch(() => {}); await sleep(slow ? 1400 : 800); }
   } catch {}
   try {
-    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 8000 });
+    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: slow ? 16000 : 8000 });
     return true;
   } catch {
     await page.evaluate(() => window.scrollTo(0, 300));
-    await sleep(700);
-    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: 6000 });
+    await sleep(slow ? 1000 : 700);
+    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: slow ? 12000 : 6000 });
     return true;
   }
 }
@@ -241,7 +241,8 @@ async function extractContributorName(page) {
 
 /* --------------------------- core scraper --------------------------- */
 
-async function scrapeCounts(contribUrl) {
+async function scrapeCounts(contribUrl, mode = "normal") {
+  const slow = String(mode || "normal") === "slow";
   const browser = await getBrowser();
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
@@ -249,8 +250,8 @@ async function scrapeCounts(contribUrl) {
   await page.setUserAgent(UA);
   await page.setViewport?.({ width: 1366, height: 900 });
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-  page.setDefaultNavigationTimeout?.(25_000);
-  page.setDefaultTimeout?.(15_000);
+  page.setDefaultNavigationTimeout?.(slow ? 45000 : 25000);
+  page.setDefaultTimeout?.(slow ? 25000 : 15000);
 
   await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
 
@@ -271,12 +272,21 @@ async function scrapeCounts(contribUrl) {
   for (let i = 0; i < candidates.length; i++) {
     const url = candidates[i];
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: slow ? 40000 : 20000 });
+      } catch (e1) {
+        if (slow) {
+          await sleep(1200);
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+        } else {
+          throw e1;
+        }
+      }
       const preTxt = (await page.evaluate(() => document.body.innerText)) || "";
       if (/Before you continue to Google/i.test(preTxt)) throw new Error("consent wall");
 
       let nameEarly = await extractContributorName(page).catch(() => null);
-      await openStatsModal(page);
+      await openStatsModal(page, slow);
 
       for (let j = 0; j < 2; j++) {
         await page.evaluate((y) => window.scrollTo(0, y), 350 * (j + 1));
@@ -321,8 +331,8 @@ app.get("/localguides/summary", async (req, res) => {
 
   try {
     const { url, counts } = await withDeadline(
-      deduped(key, () => scrapeLimiter.run(() => scrapeCounts(src))),
-      45_000,
+      deduped(key, () => scrapeLimiter.run(() => scrapeCounts(src, req.query.mode))),
+      75_000,
       "scrapeCounts"
     );
     const payload = { contribUrl: url, fetchedAt: new Date().toISOString(), ...counts };
@@ -353,7 +363,6 @@ app.get("/__ls", (_req, res) => {
       .toString();
     res.type("text/plain").send(out);
   } catch (e) {
-    // ✅ fixed: close the parenthesis
     res.status(500).type("text/plain").send(String(e));
   }
 });
