@@ -24,7 +24,8 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const toNum = (v) => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
+const toNum = (v) =>
+  v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0;
 
 function normalizeIdOrUrl(raw) {
   const r = String(raw || "").trim();
@@ -53,8 +54,11 @@ async function withDeadline(promise, ms, label = "operation") {
   const gate = new Promise((_, rej) => {
     t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
   });
-  try { return await Promise.race([promise, gate]); }
-  finally { clearTimeout(t); }
+  try {
+    return await Promise.race([promise, gate]);
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 /* --------------------- Chrome discovery & launch --------------------- */
@@ -62,7 +66,10 @@ async function withDeadline(promise, ms, label = "operation") {
 function findChromeBinary() {
   const override = process.env.PUPPETEER_EXECUTABLE_PATH;
   if (override) {
-    try { fs.accessSync(override, fs.constants.X_OK); return override; } catch {}
+    try {
+      fs.accessSync(override, fs.constants.X_OK);
+      return override;
+    } catch {}
   }
   const ROOT = "/opt/render/project/src/.puppeteer-cache";
   const names = new Set(["chrome", "chrome-headless-shell", "Chromium"]);
@@ -74,7 +81,10 @@ function findChromeBinary() {
         const p = path.join(dir, ent.name);
         if (ent.isDirectory()) stack.push(p);
         else if (ent.isFile() && names.has(path.basename(p))) {
-          try { fs.accessSync(p, fs.constants.X_OK); return p; } catch {}
+          try {
+            fs.accessSync(p, fs.constants.X_OK);
+            return p;
+          } catch {}
         }
       }
     }
@@ -121,7 +131,9 @@ async function getBrowser() {
 function scheduleIdleClose(ms = 60_000) {
   if (_idleTimer) clearTimeout(_idleTimer);
   _idleTimer = setTimeout(async () => {
-    try { await _browser?.close(); } catch {}
+    try {
+      await _browser?.close();
+    } catch {}
     _browser = null;
     _idleTimer = null;
   }, ms);
@@ -129,11 +141,14 @@ function scheduleIdleClose(ms = 60_000) {
 
 /* ---------------- small in-memory cache (5 min TTL) ---------------- */
 
-const cache = new Map();
+const cache = new Map(); // key -> {data, exp}
 function getCache(k) {
   const v = cache.get(k);
   if (!v) return null;
-  if (Date.now() > v.exp) { cache.delete(k); return null; }
+  if (Date.now() > v.exp) {
+    cache.delete(k);
+    return null;
+  }
   return v.data;
 }
 function setCache(k, data, ms = 5 * 60 * 1000) {
@@ -143,25 +158,36 @@ function setCache(k, data, ms = 5 * 60 * 1000) {
 /* ------------- concurrency limiter + deduped in-flight -------------- */
 
 class Limiter {
-  constructor(max = 2) { this.max = max; this.active = 0; this.waiters = []; }
+  constructor(max = 1) {
+    this.max = max;
+    this.active = 0;
+    this.waiters = [];
+  }
   async run(task) {
-    if (this.active >= this.max) await new Promise(res => this.waiters.push(res));
+    if (this.active >= this.max)
+      await new Promise((res) => this.waiters.push(res));
     this.active++;
-    try { return await task(); }
-    finally {
+    try {
+      return await task();
+    } finally {
       this.active--;
       const next = this.waiters.shift();
       if (next) next();
     }
   }
 }
-const scrapeLimiter = new Limiter(Number(process.env.SCRAPE_CONCURRENCY || 1));
-const inflight = new Map();
+const scrapeLimiter = new Limiter(
+  Number(process.env.SCRAPE_CONCURRENCY || 1)
+);
+const inflight = new Map(); // key -> Promise
 async function deduped(key, fn) {
   if (inflight.has(key)) return inflight.get(key);
   const p = (async () => {
-    try { return await fn(); }
-    finally { inflight.delete(key); }
+    try {
+      return await fn();
+    } finally {
+      inflight.delete(key);
+    }
   })();
   inflight.set(key, p);
   return p;
@@ -174,40 +200,74 @@ async function openStatsModal(page, slow = false) {
   try {
     await page.waitForSelector(chipSel, { timeout: slow ? 12000 : 6000 });
     const chip = await page.$(chipSel);
-    if (chip) { await chip.click().catch(() => {}); await sleep(slow ? 1400 : 800); }
+    if (chip) {
+      await chip.click().catch(() => {});
+      await sleep(slow ? 1400 : 800);
+    }
   } catch {}
   try {
-    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: slow ? 16000 : 8000 });
+    await page.waitForSelector(".QrGqBf .nKYSz .FM5HI", {
+      timeout: slow ? 16000 : 8000,
+    });
     return true;
   } catch {
     await page.evaluate(() => window.scrollTo(0, 300));
     await sleep(slow ? 1000 : 700);
-    await page.waitForSelector('.QrGqBf .nKYSz .FM5HI', { timeout: slow ? 12000 : 6000 });
+    await page.waitForSelector(".QrGqBf .nKYSz .FM5HI", {
+      timeout: slow ? 12000 : 6000,
+    });
     return true;
   }
 }
 
 async function extractCountsFromModal(page) {
   return await page.evaluate(() => {
-    const toNum = v => (v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0);
+    const toNum = (v) =>
+      v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0;
     const out = {
-      reviews: 0, ratings: 0, photos: 0, edits: 0, questions: 0, facts: 0,
-      roadsAdded: 0, placesAdded: 0, listsPublished: 0
+      reviews: 0,
+      ratings: 0,
+      photos: 0,
+      edits: 0,
+      questions: 0, // (Google calls it Answers)
+      facts: 0,
+      roadsAdded: 0,
+      placesAdded: 0,
+      listsPublished: 0,
     };
     const rows = Array.from(document.querySelectorAll(".QrGqBf .nKYSz"));
     for (const r of rows) {
-      const label = (r.querySelector(".FM5HI")?.textContent || "").trim().toLowerCase();
+      const label = (r.querySelector(".FM5HI")?.textContent || "")
+        .trim()
+        .toLowerCase();
       const value = toNum(r.querySelector(".AyEQdd")?.textContent || "0");
       switch (label) {
-        case "reviews": out.reviews = value; break;
-        case "ratings": out.ratings = value; break;
-        case "photos": out.photos = value; break;
-        case "answers": out.questions = value; break;
-        case "edits": out.edits = value; break;
+        case "reviews":
+          out.reviews = value;
+          break;
+        case "ratings":
+          out.ratings = value;
+          break;
+        case "photos":
+          out.photos = value;
+          break;
+        case "answers":
+          out.questions = value;
+          break;
+        case "edits":
+          out.edits = value;
+          break;
         case "reported incorrect":
-        case "facts checked": out.facts = Math.max(out.facts, value); break;
-        case "places added": out.placesAdded = value; break;
-        case "roads added": out.roadsAdded = value; break;
+        case "facts checked":
+          out.facts = Math.max(out.facts, value);
+          break;
+        case "places added":
+          out.placesAdded = value;
+          break;
+        case "roads added":
+          out.roadsAdded = value;
+          break;
+        // videos, captions, q&a omitted
       }
     }
     return out;
@@ -218,21 +278,29 @@ async function extractContributorName(page) {
   const sels = [
     'h1.geAzIe.fontHeadlineLarge',
     'h1[role="button"][aria-haspopup="true"]',
-    '.fontHeadlineLarge',
-    'header h1',
+    ".fontHeadlineLarge",
+    "header h1",
   ];
   for (const s of sels) {
     try {
-      const name = await page.$eval(s, el => (el.textContent || "").trim());
+      const name = await page.$eval(s, (el) => (el.textContent || "").trim());
       if (name) return name;
     } catch {}
   }
   try {
     const guess = await page.evaluate(() => {
       const text = document.body.innerText || "";
-      const lines = text.split("\n").slice(0, 50).map(s => s.trim()).filter(Boolean);
+      const lines = text
+        .split("\n")
+        .slice(0, 50)
+        .map((s) => s.trim())
+        .filter(Boolean);
       const re = /^[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+){1,2}$/;
-      return lines.find(l => re.test(l) && !/Google Maps|Local Guide/i.test(l)) || null;
+      return (
+        lines.find(
+          (l) => re.test(l) && !/Google Maps|Local Guide|My Contributions/i.test(l)
+        ) || null
+      );
     });
     if (guess) return guess;
   } catch {}
@@ -250,10 +318,15 @@ async function scrapeCounts(contribUrl, mode = "normal") {
   await page.setUserAgent(UA);
   await page.setViewport?.({ width: 1366, height: 900 });
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
-  page.setDefaultNavigationTimeout?.(slow ? 45000 : 25000);
-  page.setDefaultTimeout?.(slow ? 25000 : 15000);
+  page.setDefaultNavigationTimeout?.(slow ? 45_000 : 25_000);
+  page.setDefaultTimeout?.(slow ? 25_000 : 15_000);
 
-  await page.setCookie({ name: "CONSENT", value: "YES+cb", domain: ".google.com", path: "/" });
+  await page.setCookie({
+    name: "CONSENT",
+    value: "YES+cb",
+    domain: ".google.com",
+    path: "/",
+  });
 
   await page.setRequestInterception(true);
   page.on("request", (req) => {
@@ -273,17 +346,25 @@ async function scrapeCounts(contribUrl, mode = "normal") {
     const url = candidates[i];
     try {
       try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: slow ? 40000 : 20000 });
+        await page.goto(url, {
+          waitUntil: "domcontentloaded",
+          timeout: slow ? 40_000 : 20_000,
+        });
       } catch (e1) {
         if (slow) {
           await sleep(1200);
-          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+          await page.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: 35_000,
+          });
         } else {
           throw e1;
         }
       }
+
       const preTxt = (await page.evaluate(() => document.body.innerText)) || "";
-      if (/Before you continue to Google/i.test(preTxt)) throw new Error("consent wall");
+      if (/Before you continue to Google/i.test(preTxt))
+        throw new Error("consent wall");
 
       let nameEarly = await extractContributorName(page).catch(() => null);
       await openStatsModal(page, slow);
@@ -296,10 +377,11 @@ async function scrapeCounts(contribUrl, mode = "normal") {
       const domCounts = await extractCountsFromModal(page);
       const bodyText = (await page.evaluate(() => document.body.innerText)) || "";
       const { level, points } = pullLevelPoints(bodyText);
-      let name = nameEarly || await extractContributorName(page).catch(() => null);
+      let name = nameEarly || (await extractContributorName(page).catch(() => null));
 
       await ctx.close();
       scheduleIdleClose();
+
       return {
         url,
         counts: { name, level, points, ...domCounts },
@@ -307,9 +389,10 @@ async function scrapeCounts(contribUrl, mode = "normal") {
     } catch (e) {
       const msg = String(e || "");
       lastErr = msg;
-      if (/consent wall/i.test(msg)) break;
-      const isTimeout = /timeout/i.test(msg) || /Waiting for selector/i.test(msg);
-      if (!(isTimeout && i === 0)) break;
+      if (/consent wall/i.test(msg)) break; // no point retrying other candidate
+      const isTimeout =
+        /timeout/i.test(msg) || /Waiting for selector/i.test(msg);
+      if (!(isTimeout && i === 0)) break; // only retry 2nd candidate on first timeout
     }
   }
 
@@ -320,27 +403,123 @@ async function scrapeCounts(contribUrl, mode = "normal") {
 
 /* ------------------------------ routes ------------------------------ */
 
+// Structured errors + mode=slow support + logging
 app.get("/localguides/summary", async (req, res) => {
   const src = normalizeIdOrUrl(req.query.contrib_url);
-  if (!src)
-    return res.status(400).json({ error: "Provide ?contrib_url=.../maps/contrib/<id>" });
+  const mode = String(req.query.mode || "").toLowerCase(); // allow ?mode=slow
+  if (!src) {
+    return res.status(400).json({
+      ok: false,
+      code: "BAD_REQUEST",
+      message: "Provide ?contrib_url=.../maps/contrib/<id> or numeric id",
+    });
+  }
 
-  const key = `sum:${src}`;
+  const key = `sum:${mode}:${src}`; // cache includes mode
   const cached = getCache(key);
   if (cached) return res.json(cached);
 
   try {
+    const deadline = mode === "slow" ? 90_000 : 75_000;
     const { url, counts } = await withDeadline(
-      deduped(key, () => scrapeLimiter.run(() => scrapeCounts(src, req.query.mode))),
-      75_000,
+      deduped(key, () => scrapeLimiter.run(() => scrapeCounts(src, mode))),
+      deadline,
       "scrapeCounts"
     );
-    const payload = { contribUrl: url, fetchedAt: new Date().toISOString(), ...counts };
+    const payload = {
+      ok: true,
+      contribUrl: url,
+      fetchedAt: new Date().toISOString(),
+      ...counts,
+    };
     setCache(key, payload);
     return res.json(payload);
   } catch (e) {
-    return res.status(422).json({ error: String(e) });
+    const errText = String(e?.message || e);
+    console.error("[summary] FAIL", { id: src, mode, err: errText });
+    return res.status(422).json({
+      ok: false,
+      code: "SCRAPE_FAILED",
+      message: errText,
+      hint: "Retry with &mode=slow or call /localguides/diag-rows for details.",
+    });
   }
+});
+
+// Diagnostics: see the rows & level/points we can read on the page
+app.get("/localguides/diag-rows", async (req, res) => {
+  try {
+    const src = normalizeIdOrUrl(req.query.contrib_url);
+    const mode = String(req.query.mode || "").toLowerCase();
+    if (!src)
+      return res
+        .status(400)
+        .json({ ok: false, code: "BAD_REQUEST", message: "Missing ?contrib_url" });
+
+    const browser = await getBrowser();
+    const ctx = await browser.createBrowserContext();
+    const page = await ctx.newPage();
+
+    await page.setUserAgent(UA);
+    await page.setViewport?.({ width: 1366, height: 900 });
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+    page.setDefaultNavigationTimeout?.(mode === "slow" ? 45_000 : 25_000);
+    page.setDefaultTimeout?.(mode === "slow" ? 25_000 : 15_000);
+
+    await page.setCookie({
+      name: "CONSENT",
+      value: "YES+cb",
+      domain: ".google.com",
+      path: "/",
+    });
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const t = req.resourceType();
+      if (t === "image" || t === "media" || t === "font") return req.abort();
+      req.continue();
+    });
+
+    await page.goto(`${src}?hl=en&gl=us&authuser=0`, {
+      waitUntil: "domcontentloaded",
+    });
+
+    const name = await extractContributorName(page).catch(() => null);
+    await openStatsModal(page, mode === "slow");
+
+    const rows = await page.evaluate(() => {
+      const toNum = (v) =>
+        v == null ? 0 : Number(String(v).replace(/[^\d]/g, "")) || 0;
+      return Array.from(document.querySelectorAll(".QrGqBf .nKYSz")).map((r) => ({
+        label: (r.querySelector(".FM5HI")?.textContent || "").trim(),
+        value: toNum(r.querySelector(".AyEQdd")?.textContent || "0"),
+      }));
+    });
+
+    const bodyText = (await page.evaluate(() => document.body.innerText)) || "";
+    const levelMatch =
+      /Local Guide[^\n]{0,200}?(?:Level|•\s*Level)\s*(\d+)/i.exec(bodyText);
+    const pointsMatch = /(\d[\d,\.]*)\s+(?:points|pts)\b/i.exec(bodyText);
+    const level = levelMatch ? Number(String(levelMatch[1])) : 0;
+    const points = pointsMatch
+      ? Number(String(pointsMatch[1]).replace(/[^\d]/g, ""))
+      : 0;
+
+    await ctx.close();
+    scheduleIdleClose();
+
+    res.json({ ok: true, name, rows, level, points });
+  } catch (e) {
+    console.error("[diag-rows] FAIL", String(e));
+    res
+      .status(422)
+      .json({ ok: false, code: "DIAG_FAILED", message: String(e) });
+  }
+});
+
+// Optional alias: /localguides/debug → /localguides/diag-rows
+app.get("/localguides/debug", (req, res) => {
+  req.url = req.url.replace("/localguides/debug", "/localguides/diag-rows");
+  app._router.handle(req, res);
 });
 
 /* ------------------------------ misc ------------------------------ */
